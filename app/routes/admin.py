@@ -16,6 +16,7 @@ from app.models import (
     PrepGroupLeaderAssignment,
 )
 from datetime import datetime
+import re  # 引入正则模块用于校验
 
 admin_bp = Blueprint("admin", __name__)
 
@@ -270,47 +271,109 @@ def get_students():
     if class_id:
         query = query.filter_by(class_id=class_id)
 
-    # 分页查询，这对老旧电脑至关重要
-    pagination = query.paginate(page=page, per_page=limit, error_out=False)
-    students = pagination.items
-
-    return jsonify(
-        {
-            "total": pagination.total,
-            "data": [
-                {
-                    "id": s.id,
-                    "student_id": s.student_id,
-                    "name": s.name,
-                    "gender": s.gender,
-                    "class_id": s.class_id,
-                    "grade_class": (
-                        f"{s.current_class.grade_display}({s.current_class.class_num})班"
-                        if s.current_class
-                        else "未分配"
-                    ),
-                }
-                for s in students
-            ],
-        }
+    pagination = query.order_by(Student.student_id.asc()).paginate(
+        page=page, per_page=limit, error_out=False
     )
+
+    data = []
+    for s in pagination.items:
+        # 格式化班级名
+        class_name = "未分配"
+        if s.current_class_rel:
+            c = s.current_class_rel
+            short_year = str(c.entry_year)[-2:]
+            class_num_str = str(c.class_num).zfill(2)
+            class_name = f"{short_year}级({class_num_str})班"
+
+        data.append(
+            {
+                "id": s.id,
+                "student_id": s.student_id,
+                "name": s.name,
+                "gender": s.gender,
+                "class_id": s.class_id,
+                "grade_class": class_name,
+                "status": s.status,
+                "household_registration": s.household_registration,
+                "city_school_id": s.city_school_id,
+                "national_school_id": s.national_school_id,
+                "id_card_number": s.id_card_number,  # 新增返回
+                "remarks": s.remarks,
+            }
+        )
+
+    return jsonify({"total": pagination.total, "data": data})
 
 
 @admin_bp.route("/students", methods=["POST"])
 def add_student():
     data = request.get_json()
+
+    # 基础校验
     if Student.query.filter_by(student_id=data["student_id"]).first():
         return jsonify({"msg": "学号已存在"}), 400
+
+    # 身份证查重
+    id_card = data.get("id_card_number")
+    if id_card and Student.query.filter_by(id_card_number=id_card).first():
+        return jsonify({"msg": "身份证号已存在"}), 400
+
+    # 校验市学籍号 (必须为纯数字)
+    city_sid = data.get("city_school_id", "")
+    if city_sid and not city_sid.isdigit():
+        return jsonify({"msg": "市学籍号必须为纯数字"}), 400
 
     student = Student(
         student_id=data["student_id"],
         name=data["name"],
-        gender=data.get("gender", "未知"),
+        gender=data.get("gender", "男"),
         class_id=data["class_id"],
+        status=data.get("status", "在读"),
+        household_registration=data.get("household_registration"),
+        city_school_id=city_sid,
+        national_school_id=data.get("national_school_id"),
+        id_card_number=id_card,  # 新增保存
+        remarks=data.get("remarks"),
     )
     db.session.add(student)
     db.session.commit()
     return jsonify({"msg": "学生添加成功"})
+
+
+@admin_bp.route("/students/<int:s_id>", methods=["PUT"])
+def update_student(s_id):
+    data = request.get_json()
+    student = Student.query.get(s_id)
+    if not student:
+        return jsonify({"msg": "学生不存在"}), 404
+
+    # 校验市学籍号
+    city_sid = data.get("city_school_id", student.city_school_id)
+    if city_sid and not str(city_sid).isdigit():
+        return jsonify({"msg": "市学籍号必须为纯数字"}), 400
+
+    # 校验身份证查重 (排除自己)
+    new_id_card = data.get("id_card_number")
+    if new_id_card and new_id_card != student.id_card_number:
+        if Student.query.filter_by(id_card_number=new_id_card).first():
+            return jsonify({"msg": "该身份证号已被其他学生占用"}), 400
+
+    student.name = data.get("name", student.name)
+    student.gender = data.get("gender", student.gender)
+    student.class_id = data.get("class_id", student.class_id)
+    student.status = data.get("status", student.status)
+    student.household_registration = data.get(
+        "household_registration", student.household_registration
+    )
+    student.city_school_id = city_sid
+    student.national_school_id = data.get(
+        "national_school_id", student.national_school_id
+    )
+    student.id_card_number = new_id_card  # 新增更新
+    student.remarks = data.get("remarks", student.remarks)
+
+    db.session.commit()
+    return jsonify({"msg": "学生信息更新成功"})
 
 
 # --- 5. 成绩统计与排名 ---

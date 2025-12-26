@@ -162,11 +162,22 @@ class Student(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     student_id = db.Column(db.String(20), unique=True, nullable=False)
     name = db.Column(db.String(64), nullable=False)
-    gender = db.Column(db.String(10))
+    gender = db.Column(db.String(10), default="男")
     class_id = db.Column(db.Integer, db.ForeignKey("classes.id"))
-    status = db.Column(db.String(20), default="active")
+
+    status = db.Column(db.String(20), default="在读")
+    household_registration = db.Column(db.String(50))
+
+    # 学籍号
+    city_school_id = db.Column(db.String(50))  # 市学籍号 (验证逻辑确保纯数字)
+    national_school_id = db.Column(db.String(50))  # 国家学籍号 (字符串, 如 G440...)
+
+    id_card_number = db.Column(db.String(20), unique=True)  # 身份证号
+
+    remarks = db.Column(db.String(255))
+
     scores = db.relationship("Score", backref="student", lazy="dynamic")
-    current_class_rel = db.relationship("ClassInfo")  # 避免重名冲突
+    current_class_rel = db.relationship("ClassInfo")
 
 
 class Score(db.Model):
