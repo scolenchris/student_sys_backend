@@ -1,4 +1,6 @@
 from flask import Blueprint, request, jsonify
+import pandas as pd
+import os
 from app.models import (
     db,
     User,
@@ -510,3 +512,106 @@ def delete_assignment(a_id):
 def get_all_subjects():
     subs = Subject.query.all()
     return jsonify([{"id": s.id, "name": s.name} for s in subs])
+
+
+# --- 7. Excel 导入功能 ---
+@admin_bp.route("/students/import", methods=["POST"])
+def import_students_excel():
+    if "file" not in request.files:
+        return jsonify({"msg": "没有上传文件"}), 400
+
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"msg": "文件名为空"}), 400
+
+    try:
+        # 读取 Excel
+        df = pd.read_excel(file)
+
+        # 简单校验表头是否包含关键字段
+        required_columns = ["姓名", "学号", "班级名称"]
+        if not all(col in df.columns for col in required_columns):
+            return (
+                jsonify({"msg": "Excel格式错误，缺少必要列(姓名/学号/班级名称)"}),
+                400,
+            )
+
+        success_count = 0
+        updated_count = 0
+
+        for index, row in df.iterrows():
+            # 1. 解析班级信息 "23级(01)班" -> entry_year=2023, class_num=1
+            class_str = str(row["班级名称"]).strip()
+            # 正则匹配：数字 + 级 + ( + 数字 + ) + 班
+            match = re.match(r"(\d+)级\((\d+)\)班", class_str)
+
+            class_id = None
+            if match:
+                short_year = int(match.group(1))  # 23
+                class_num = int(match.group(2))  # 01
+                # 假设是 20xx 年
+                entry_year = 2000 + short_year
+
+                # 查找班级是否存在，不存在则创建
+                existing_class = ClassInfo.query.filter_by(
+                    entry_year=entry_year, class_num=class_num
+                ).first()
+                if existing_class:
+                    class_id = existing_class.id
+                else:
+                    new_class = ClassInfo(entry_year=entry_year, class_num=class_num)
+                    db.session.add(new_class)
+                    db.session.flush()  # 以此获取 id
+                    class_id = new_class.id
+            else:
+                # 班级格式不对，跳过或记录日志，这里选择暂时跳过该行或设为未分配
+                continue
+
+            # 2. 准备学生数据
+            student_id = str(row["学号"]).strip()
+
+            # 检查学生是否已存在 (更新或跳过，这里选择更新)
+            student = Student.query.filter_by(student_id=student_id).first()
+            is_new = False
+
+            if not student:
+                student = Student(student_id=student_id)
+                is_new = True
+
+            # 填充/更新字段
+            student.name = str(row["姓名"])
+            student.gender = str(row.get("性别", "男"))
+            student.class_id = class_id
+            student.status = str(row.get("状态", "在读"))
+            student.household_registration = str(row.get("户口属地", "本市"))
+            student.id_card_number = str(row.get("身份证号", ""))
+
+            # 处理学籍号，确保是字符串且去除 .0 (pandas读取数字有时会带小数)
+            city_sid = str(row.get("市学籍号", ""))
+            if city_sid.endswith(".0"):
+                city_sid = city_sid[:-2]
+            student.city_school_id = city_sid
+
+            nat_sid = str(row.get("国家学籍号", ""))
+            if nat_sid.endswith(".0"):
+                nat_sid = nat_sid[:-2]
+            student.national_school_id = nat_sid
+
+            student.remarks = (
+                str(row.get("备注", "")) if pd.notna(row.get("备注")) else ""
+            )
+
+            if is_new:
+                db.session.add(student)
+                success_count += 1
+            else:
+                updated_count += 1
+
+        db.session.commit()
+        return jsonify(
+            {"msg": f"操作完成", "added": success_count, "updated": updated_count}
+        )
+
+    except Exception as e:
+        print(e)
+        return jsonify({"msg": f"导入失败: {str(e)}"}), 500
