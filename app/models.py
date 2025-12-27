@@ -14,6 +14,7 @@ class User(db.Model):
     role = db.Column(db.String(20), nullable=False)
     is_approved = db.Column(db.Boolean, default=False)
     teacher_profile = db.relationship("Teacher", backref="user", uselist=False)
+    must_change_password = db.Column(db.Boolean, default=False)
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)

@@ -229,6 +229,21 @@ def update_teacher(t_id):
     return jsonify({"msg": "教师信息更新成功"})
 
 
+# 重置教师密码
+@admin_bp.route("/teachers/<int:t_id>/reset_password", methods=["POST"])
+def reset_teacher_password(t_id):
+    teacher = Teacher.query.get(t_id)
+    if not teacher or not teacher.user:
+        return jsonify({"msg": "教师账号不存在"}), 404
+
+    user = teacher.user
+    user.set_password("123456")  # 重置为初始密码
+    user.must_change_password = True  # 标记为需要强制修改
+    db.session.commit()
+
+    return jsonify({"msg": f"教师 {teacher.name} 的密码已重置为 123456"})
+
+
 # --- 3. 班级管理 ---
 
 
@@ -665,7 +680,12 @@ def import_teachers_excel():
 
             # --- 创建新用户 ---
             # 因为前面已经清空了，这里直接创建即可
-            user = User(username=username, role="teacher", is_approved=True)
+            user = User(
+                username=username,
+                role="teacher",
+                is_approved=True,
+                must_change_password=True,
+            )
             user.set_password("123456")
             db.session.add(user)
             db.session.flush()  # 获取 user.id
