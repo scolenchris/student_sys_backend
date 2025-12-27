@@ -1,5 +1,14 @@
 from flask import Blueprint, request, jsonify
-from app.models import db, Teacher, CourseAssignment, ClassInfo, Subject, Student, Score
+from app.models import (
+    db,
+    Teacher,
+    CourseAssignment,
+    ClassInfo,
+    Subject,
+    Student,
+    Score,
+    ExamTask,
+)
 
 teacher_bp = Blueprint("teacher", __name__)
 
@@ -58,17 +67,19 @@ def get_my_courses(user_id):
 @teacher_bp.route("/score_list", methods=["GET"])
 def get_score_list():
     class_id = request.args.get("class_id")
-    subject_id = request.args.get("subject_id")
-    term = request.args.get("term", "2024-2025-1")  # 默认当前学期
+    # subject_id = request.args.get('subject_id') # 现在主要靠 task 确定科目，但保留校验也可以
+    exam_task_id = request.args.get("exam_task_id")  # 核心参数
 
-    # 获取该班级所有在读学生
+    if not exam_task_id:
+        return jsonify([])
+
+    # 修正之前的bug：状态使用中文 '在读'
     students = Student.query.filter_by(class_id=class_id, status="在读").all()
 
     result = []
     for s in students:
-        # 查找该生该科目在该学期的成绩
         score_record = Score.query.filter_by(
-            student_id=s.id, subject_id=subject_id, term=term
+            student_id=s.id, exam_task_id=exam_task_id
         ).first()
 
         result.append(
@@ -83,18 +94,24 @@ def get_score_list():
     return jsonify(result)
 
 
-# --- 3. 批量提交/修改成绩 ---
+# --- 3. 保存成绩 ---
 @teacher_bp.route("/save_scores", methods=["POST"])
 def save_scores():
     data = request.get_json()
-    subject_id = data.get("subject_id")
-    term = data.get("term")
-    scores_data = data.get("scores")  # 格式: [{"student_id": 1, "score": 95}, ...]
+    exam_task_id = data.get("exam_task_id")
+    subject_id = data.get("subject_id")  # 冗余字段，可用于校验
+    scores_data = data.get("scores")  # [{"student_id": 1, "score": 95}, ...]
+
+    task = ExamTask.query.get(exam_task_id)
+    if not task:
+        return jsonify({"msg": "考试任务不存在"}), 404
+
+    if not task.is_active:
+        return jsonify({"msg": "该考试录入通道已关闭，无法保存"}), 403
 
     for item in scores_data:
-        # 查找是否已有记录
         existing_score = Score.query.filter_by(
-            student_id=item["student_id"], subject_id=subject_id, term=term
+            student_id=item["student_id"], exam_task_id=exam_task_id
         ).first()
 
         if existing_score:
@@ -102,11 +119,47 @@ def save_scores():
         else:
             new_score = Score(
                 student_id=item["student_id"],
-                subject_id=subject_id,
+                subject_id=task.subject_id,  # 从任务中获取科目ID更安全
+                exam_task_id=exam_task_id,
                 score=item["score"],
-                term=term,
+                term=task.name,  # 兼容旧字段，存考试名
             )
             db.session.add(new_score)
 
     db.session.commit()
     return jsonify({"msg": "成绩保存成功"})
+
+
+# --- 获取某班级某科目可用的考试任务 ---
+@teacher_bp.route("/available_exams", methods=["GET"])
+def get_available_exams():
+    class_id = request.args.get("class_id", type=int)
+    subject_id = request.args.get("subject_id", type=int)
+
+    if not class_id or not subject_id:
+        return jsonify([])
+
+    # 1. 找到该班级的入学年份 (entry_year)
+    cls = ClassInfo.query.get(class_id)
+    if not cls:
+        return jsonify([])
+
+    # 2. 查询该年级、该科目下所有已发布的考试
+    # 教师端通常只关心 is_active=True 的，或者全部显示但锁住禁录的
+    tasks = (
+        ExamTask.query.filter_by(entry_year=cls.entry_year, subject_id=subject_id)
+        .order_by(ExamTask.create_time.desc())
+        .all()
+    )
+
+    return jsonify(
+        [
+            {
+                "id": t.id,
+                "name": t.name,
+                "full_score": t.full_score,
+                "is_active": t.is_active,
+            }
+            for t in tasks
+        ]
+    )

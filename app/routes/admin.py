@@ -16,6 +16,7 @@ from app.models import (
     GradeLeaderAssignment,
     SubjectGroupLeaderAssignment,
     PrepGroupLeaderAssignment,
+    ExamTask,
 )
 from datetime import datetime
 import re  # 引入正则模块用于校验
@@ -796,3 +797,99 @@ def import_teachers_excel():
 
         traceback.print_exc()
         return jsonify({"msg": f"处理数据时出错: {str(e)}"}), 500
+
+
+# --- 考试发布管理 ---
+@admin_bp.route("/exam_tasks", methods=["GET"])
+def get_exam_tasks():
+    # 支持筛选
+    entry_year = request.args.get("entry_year", type=int)
+    subject_id = request.args.get("subject_id", type=int)
+
+    query = ExamTask.query
+    if entry_year:
+        query = query.filter_by(entry_year=entry_year)
+    if subject_id:
+        query = query.filter_by(subject_id=subject_id)
+
+    tasks = query.order_by(ExamTask.create_time.desc()).all()
+
+    return jsonify(
+        [
+            {
+                "id": t.id,
+                "name": t.name,
+                "entry_year": t.entry_year,
+                "grade_name": t.grade_name,  # 动态计算的年级名 (如初一)
+                "subject_id": t.subject_id,
+                "subject_name": t.subject.name if t.subject else "-",
+                "full_score": t.full_score,
+                "is_active": t.is_active,
+            }
+            for t in tasks
+        ]
+    )
+
+
+@admin_bp.route("/exam_tasks", methods=["POST"])
+def add_exam_task():
+    data = request.get_json()
+    # 简单的防重复：同年级、同科目、同名
+    exists = ExamTask.query.filter_by(
+        entry_year=data["entry_year"], subject_id=data["subject_id"], name=data["name"]
+    ).first()
+
+    if exists:
+        return jsonify({"msg": "该考试任务已存在"}), 400
+
+    new_task = ExamTask(
+        name=data["name"],
+        entry_year=data["entry_year"],
+        subject_id=data["subject_id"],
+        full_score=data.get("full_score", 100),
+        is_active=data.get("is_active", True),
+    )
+    db.session.add(new_task)
+    db.session.commit()
+    return jsonify({"msg": "发布成功"})
+
+
+@admin_bp.route("/exam_tasks/<int:id>", methods=["PUT"])
+def update_exam_task(id):
+    task = ExamTask.query.get(id)
+    if not task:
+        return jsonify({"msg": "任务不存在"}), 404
+
+    data = request.get_json()
+    if "full_score" in data:
+        task.full_score = data["full_score"]
+    if "is_active" in data:
+        task.is_active = data["is_active"]
+    if "name" in data:
+        task.name = data["name"]
+
+    db.session.commit()
+    return jsonify({"msg": "更新成功"})
+
+
+@admin_bp.route("/exam_tasks/<int:id>", methods=["DELETE"])
+def delete_exam_task(id):
+    task = ExamTask.query.get(id)
+    if not task:
+        return jsonify({"msg": "任务不存在"}), 404
+
+    try:
+        # 1. 关键步骤：先删除该任务下所有已登记的成绩
+        # 这样避免了外键约束冲突，同时也清理了旧数据
+        Score.query.filter_by(exam_task_id=id).delete()
+
+        # 2. 成绩清理完毕后，再删除任务本身
+        db.session.delete(task)
+        db.session.commit()
+
+        return jsonify({"msg": "删除成功，相关成绩记录已同步清理"})
+
+    except Exception as e:
+        # 发生任何错误时回滚，保证数据一致性
+        db.session.rollback()
+        return jsonify({"msg": f"删除失败: {str(e)}"}), 500
