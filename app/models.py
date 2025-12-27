@@ -68,7 +68,7 @@ class ClassInfo(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     entry_year = db.Column(db.Integer, nullable=False)
     class_num = db.Column(db.Integer, nullable=False)
-    students = db.relationship("Student", backref="current_class", lazy="dynamic")
+    students = db.relationship("Student", backref="current_class_rel", lazy="dynamic")
 
     @property
     def grade_display(self):
@@ -178,7 +178,7 @@ class Student(db.Model):
     remarks = db.Column(db.String(255))
 
     scores = db.relationship("Score", backref="student", lazy="dynamic")
-    current_class_rel = db.relationship("ClassInfo")
+    # current_class_rel = db.relationship("ClassInfo") # 反向引用已在 ClassInfo 定义，会冲突
 
 
 class Score(db.Model):
