@@ -515,6 +515,7 @@ def get_all_subjects():
 
 
 # --- 7. Excel 导入功能 ---
+# 导入学生
 @admin_bp.route("/students/import", methods=["POST"])
 def import_students_excel():
     if "file" not in request.files:
@@ -615,3 +616,174 @@ def import_students_excel():
     except Exception as e:
         print(e)
         return jsonify({"msg": f"导入失败: {str(e)}"}), 500
+
+
+# 导入老师
+@admin_bp.route("/teachers/import", methods=["POST"])
+def import_teachers_excel():
+    if "file" not in request.files:
+        return jsonify({"msg": "没有上传文件"}), 400
+
+    file = request.files["file"]
+    try:
+        df = pd.read_excel(file)
+        # 填充 NaN 为空字符串，防止报错
+        df = df.fillna("")
+    except Exception as e:
+        return jsonify({"msg": f"读取Excel失败: {str(e)}"}), 400
+
+    # --- 1. 预处理：构建缓存字典，减少数据库查询次数 ---
+    # 构建科目映射: {'语文': 1, '数学': 2}
+    all_subjects = Subject.query.all()
+    subject_map = {s.name: s.id for s in all_subjects}
+
+    # 构建班级映射: {(2023, 1): 5}  key是(年份, 班号), value是class_id
+    all_classes = ClassInfo.query.all()
+    class_map = {(c.entry_year, c.class_num): c.id for c in all_classes}
+
+    success_count = 0
+
+    try:
+        for index, row in df.iterrows():
+            username = str(row.get("工号", "")).strip()
+            name = str(row.get("姓名", "")).strip()
+            if not username or not name:
+                continue  # 跳过无效行
+
+            # --- 2. 用户账户处理 ---
+            user = User.query.filter_by(username=username).first()
+            if not user:
+                # 创建新用户，默认密码 123456
+                user = User(username=username, role="teacher", is_approved=True)
+                user.set_password("123456")
+                db.session.add(user)
+                db.session.flush()  # 以此获取 user.id
+
+            # --- 3. 教师档案处理 ---
+            teacher = Teacher.query.filter_by(user_id=user.id).first()
+            if not teacher:
+                teacher = Teacher(user_id=user.id, name=name)
+                db.session.add(teacher)
+            else:
+                teacher.name = name  # 更新姓名
+
+            # 更新基础信息
+            teacher.gender = str(row.get("性别", "男"))
+            teacher.phone = str(row.get("电话", ""))
+            teacher.job_title = str(row.get("职称", ""))
+
+            db.session.flush()  # 确保 teacher.id 可用
+
+            # ================= 复杂职务解析 =================
+
+            # 定义分隔符处理函数 (支持中英文逗号)
+            def split_str(s):
+                return [x.strip() for x in re.split(r"[,，]", str(s)) if x.strip()]
+
+            # 辅助函数：解析班级字符串 "23级(1)班" -> class_id
+            def parse_class_id(cls_str):
+                # 匹配 "23级(1)班" 或 "2023级(01)班"
+                match = re.search(r"(\d+)级\D*?(\d+)\D*?班", cls_str)
+                if match:
+                    y_str = match.group(1)
+                    c_num = int(match.group(2))
+                    # 处理年份：如果是 23 则转为 2023
+                    entry_year = int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
+                    return class_map.get((entry_year, c_num))
+                return None
+
+            # 辅助函数：解析年份 "23级" -> 2023
+            def parse_year(yr_str):
+                match = re.search(r"(\d+)级?", yr_str)
+                if match:
+                    y_str = match.group(1)
+                    return int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
+                return None
+
+            # --- A. 班主任分配 ---
+            # 策略：先删除该老师所有的旧班主任记录，再添加新的
+            HeadTeacherAssignment.query.filter_by(teacher_id=teacher.id).delete()
+            ht_str = row.get("班主任分配", "")
+            for item in split_str(ht_str):
+                cid = parse_class_id(item)
+                if cid:
+                    db.session.add(
+                        HeadTeacherAssignment(teacher_id=teacher.id, class_id=cid)
+                    )
+
+            # --- B. 级长分配 ---
+            GradeLeaderAssignment.query.filter_by(teacher_id=teacher.id).delete()
+            gl_str = row.get("级长分配", "")
+            for item in split_str(gl_str):
+                year = parse_year(item)
+                if year:
+                    db.session.add(
+                        GradeLeaderAssignment(teacher_id=teacher.id, entry_year=year)
+                    )
+
+            # --- C. 科组长分配 ---
+            SubjectGroupLeaderAssignment.query.filter_by(teacher_id=teacher.id).delete()
+            sgl_str = row.get("科组长分配", "")
+            for item in split_str(sgl_str):
+                # 假设输入直接是科目名 "语文"
+                sid = subject_map.get(item)
+                if sid:
+                    db.session.add(
+                        SubjectGroupLeaderAssignment(
+                            teacher_id=teacher.id, subject_id=sid
+                        )
+                    )
+
+            # --- D. 备课组长分配 (格式: "23级语文") ---
+            PrepGroupLeaderAssignment.query.filter_by(teacher_id=teacher.id).delete()
+            pgl_str = row.get("备课组长分配", "")
+            for item in split_str(pgl_str):
+                # 拆解年份和科目
+                # 这里假设格式紧凑，先提取数字作为年份，剩下的作为科目
+                year_match = re.match(r"(\d+)级?", item)
+                if year_match:
+                    y_str = year_match.group(1)
+                    entry_year = int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
+                    # 移除年份部分，剩下的即为科目名 (需去掉"级"字)
+                    sub_name = item.replace(y_str, "").replace("级", "").strip()
+                    sid = subject_map.get(sub_name)
+                    if entry_year and sid:
+                        db.session.add(
+                            PrepGroupLeaderAssignment(
+                                teacher_id=teacher.id,
+                                entry_year=entry_year,
+                                subject_id=sid,
+                            )
+                        )
+
+            # --- E. 任教分配 (格式: "23级(1)班-语文") ---
+            CourseAssignment.query.filter_by(teacher_id=teacher.id).delete()
+            teach_str = row.get("任教分配", "")
+            for item in split_str(teach_str):
+                # 用 '-' 或 '_' 分隔班级和科目
+                parts = re.split(r"[-_]", item)
+                if len(parts) >= 2:
+                    cls_part = parts[0].strip()
+                    sub_part = parts[1].strip()
+
+                    cid = parse_class_id(cls_part)
+                    sid = subject_map.get(sub_part)
+
+                    if cid and sid:
+                        db.session.add(
+                            CourseAssignment(
+                                teacher_id=teacher.id, class_id=cid, subject_id=sid
+                            )
+                        )
+
+            success_count += 1
+
+        db.session.commit()
+        return jsonify({"msg": f"导入成功，共处理 {success_count} 位教师信息"})
+
+    except Exception as e:
+        db.session.rollback()
+        import traceback
+
+        traceback.print_exc()
+        return jsonify({"msg": f"处理数据时出错: {str(e)}"}), 500
