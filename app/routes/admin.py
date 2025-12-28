@@ -18,10 +18,28 @@ from app.models import (
     PrepGroupLeaderAssignment,
     ExamTask,
 )
+from sqlalchemy import func
 from datetime import datetime
 import re  # 引入正则模块用于校验
 
 admin_bp = Blueprint("admin", __name__)
+
+SUBJECT_PRIORITY = [
+    "语文",
+    "数学",
+    "英语",
+    "英语听说",
+    "物理",
+    "化学",
+    "道德与法治",
+    "历史",
+    "生物",
+    "地理",
+    "体育与健康",
+    "信息科技",
+    "美术",
+    "音乐",
+]
 
 # --- 1. 用户审核模块 ---
 
@@ -458,6 +476,183 @@ def get_class_report():
     )
 
 
+@admin_bp.route("/stats/exam_names", methods=["GET"])
+def get_grade_exam_names():
+    entry_year = request.args.get("entry_year", type=int)
+    if not entry_year:
+        return jsonify([])
+
+    # 查询该年级所有考试任务的名称并去重
+    names = (
+        db.session.query(ExamTask.name)
+        .filter_by(entry_year=entry_year)
+        .distinct()
+        .all()
+    )
+
+    # names 是 list of tuples, 如 [('初一上期末',), ('期中考',)]
+    return jsonify([n[0] for n in names])
+
+
+# 新增：综合成绩报表接口
+@admin_bp.route("/stats/comprehensive_report", methods=["POST"])
+def get_comprehensive_report():
+    data = request.get_json()
+    # 接收参数
+    entry_year = data.get("entry_year")  # 必填：入学年份 (用于确定年级)
+    exam_name = data.get("exam_name")  # 必填：考试名称 (如 "初一上期末")
+    subject_ids = data.get("subject_ids", [])  # 必填：选择的科目ID列表
+    class_ids = data.get("class_ids", [])  # 选填：查看的班级ID列表，为空则查看全级
+
+    if not entry_year or not exam_name or not subject_ids:
+        return jsonify({"msg": "请选择完整的筛选条件（年级、考试、科目）"}), 400
+
+    # 1. 获取该年级所有班级信息 (用于映射班级名和确定全级范围)
+    all_classes = ClassInfo.query.filter_by(entry_year=entry_year).all()
+    class_map = {c.id: c.full_name for c in all_classes}  # ID -> "初一(01)班"
+    all_grade_class_ids = [c.id for c in all_classes]
+
+    # 2. 获取该年级、该次考试、指定科目的 考试任务信息
+    tasks = ExamTask.query.filter(
+        ExamTask.entry_year == entry_year,
+        ExamTask.name == exam_name,
+        ExamTask.subject_id.in_(subject_ids),
+    ).all()
+
+    if not tasks:
+        return jsonify({"data": [], "subjects": []})
+
+    # 建立映射：任务ID -> 科目ID，任务ID -> 满分
+    task_map = {t.id: t.subject_id for t in tasks}
+    task_ids = [t.id for t in tasks]
+
+    # 计算所选科目的总满分
+    total_full_score = sum([t.full_score for t in tasks])
+
+    # 3. 获取全级学生 (即使只看一个班，也需要全级数据来计算级排名)
+    # 注意：这里我们获取该年级所有班级的学生
+    students = Student.query.filter(Student.class_id.in_(all_grade_class_ids)).all()
+    student_map = {s.id: s for s in students}
+
+    # 4. 获取所有相关成绩
+    scores = Score.query.filter(
+        Score.exam_task_id.in_(task_ids), Score.student_id.in_(student_map.keys())
+    ).all()
+
+    # 5. 内存中进行数据组装与排名计算
+    # 结构: { student_id: { total: 0, scores: {subj_name: score}, ... } }
+    stats_data = {}
+
+    # 获取科目名称映射
+    subjects = (
+        Subject.query.filter(Subject.id.in_(subject_ids))
+        .order_by(Subject.id.asc())
+        .all()
+    )
+
+    subject_name_map = {s.id: s.name for s in subjects}
+    ordered_subject_names = [s.name for s in subjects]
+
+    # 初始化学生数据容器
+    for s in students:
+        stats_data[s.id] = {
+            "obj": s,
+            "score_map": {},  # { '语文': 90, '数学': 100 }
+            "total": 0,
+        }
+
+    # 填充成绩
+    for sc in scores:
+        sid = sc.student_id
+        if sid in stats_data:
+            subj_id = task_map.get(sc.exam_task_id)
+            subj_name = subject_name_map.get(subj_id)
+            if subj_name:
+                stats_data[sid]["score_map"][subj_name] = sc.score
+                stats_data[sid]["total"] += sc.score
+
+    # 转换为列表以便排序
+    result_list = list(stats_data.values())
+
+    def sort_key(item):
+        sm = item["score_map"]
+        # 构建比较元组: (总分, 语文分, 数学分, ...)
+        # 使用 get(name, 0) 处理缺考情况，默认为 0 分
+        compare_tuple = [item["total"]]
+        for sub in SUBJECT_PRIORITY:
+            compare_tuple.append(sm.get(sub, 0))
+        return tuple(compare_tuple)
+
+    # --- 1. 计算级排名 (同时计算两种) ---
+    result_list.sort(key=sort_key, reverse=True)
+
+    for i, item in enumerate(result_list):
+        # A. 连续排名 (User Definition): 严格的 1, 2, 3...
+        # 既然已经按规则排好序了，直接用序号即可
+        item["grade_rank_dense"] = i + 1
+
+        # B. 跳过排名 (Legacy): 仅基于总分，同分并列 (1, 1, 3)
+        if i > 0 and item["total"] < result_list[i - 1]["total"]:
+            item["grade_rank_skip"] = i + 1
+        elif i == 0:
+            item["grade_rank_skip"] = 1
+        else:
+            # 总分相同，继承上一名的排名
+            item["grade_rank_skip"] = result_list[i - 1]["grade_rank_skip"]
+
+    # --- 2. 计算班排名 ---
+    # 先按班级分组
+    class_groups = {}
+    for item in result_list:
+        cid = item["obj"].class_id
+        if cid not in class_groups:
+            class_groups[cid] = []
+        class_groups[cid].append(item)
+
+    for cid, items in class_groups.items():
+        # 组内应用同样的排序规则
+        items.sort(key=sort_key, reverse=True)
+
+        for i, sub_item in enumerate(items):
+            # A. 班级连续 (严格 1, 2, 3)
+            sub_item["class_rank_dense"] = i + 1
+
+            # B. 班级跳过 (并列 1, 1, 3)
+            if i > 0 and sub_item["total"] < items[i - 1]["total"]:
+                sub_item["class_rank_skip"] = i + 1
+            elif i == 0:
+                sub_item["class_rank_skip"] = 1
+            else:
+                sub_item["class_rank_skip"] = items[i - 1]["class_rank_skip"]
+
+    # 6. 最终过滤与格式化输出
+    target_class_ids = set(class_ids) if class_ids else set(all_grade_class_ids)
+
+    final_output = []
+
+    # 再次按级排名顺序遍历
+    for item in result_list:
+        s = item["obj"]
+        if s.class_id in target_class_ids:
+            row = {
+                "student_id": s.student_id,
+                "name": s.name,
+                "class_name": class_map.get(s.class_id, "未知班级"),
+                "status": s.status,
+                "full_score": total_full_score,
+                "total": round(item["total"], 1),
+                # 返回四种排名
+                "grade_rank_skip": item["grade_rank_skip"],
+                "grade_rank_dense": item["grade_rank_dense"],
+                "class_rank_skip": item.get("class_rank_skip", "-"),
+                "class_rank_dense": item.get("class_rank_dense", "-"),
+                "scores": item["score_map"],
+            }
+            final_output.append(row)
+
+    return jsonify({"data": final_output, "subjects": ordered_subject_names})
+
+
 # --- 6. 任课分配管理 ---
 
 
@@ -526,7 +721,7 @@ def delete_assignment(a_id):
 # “选择科目”实现
 @admin_bp.route("/subjects", methods=["GET"])
 def get_all_subjects():
-    subs = Subject.query.all()
+    subs = Subject.query.order_by(Subject.id.asc()).all()
     return jsonify([{"id": s.id, "name": s.name} for s in subs])
 
 

@@ -24,36 +24,35 @@ def create_app(config_class=Config):
 
     # 3. 创建数据库表
     with app.app_context():
-        # 这行代码会在 MySQL 中自动创建 models.py 中定义的表
-        # 如果表已存在，则不会重复创建或修改
         db.create_all()
-
-        # 这里可以预留一个初始化管理员的函数
-        # init_admin_user()
 
         from .models import Subject
 
-        subject_list = [
+        # 【全局修正】严格按照教务处的顺序初始化
+        # 数据库 ID 将会是：1-语文, 2-数学, 3-英语, 4-英语听说 ... 14-音乐
+        target_order = [
             "语文",
             "数学",
             "英语",
-            "道德与法治",
-            "历史",
+            "英语听说",
             "物理",
             "化学",
+            "道德与法治",
+            "历史",
             "生物",
             "地理",
             "体育与健康",
+            "信息科技",
             "美术",
             "音乐",
-            "信息科技",
-            "英语听说",
         ]
 
-        for name in subject_list:
-            # 如果数据库里没有这个科目，就添加进去
-            if not Subject.query.filter_by(name=name).first():
+        # 检查是否为空，只有为空时才初始化，保证 ID 连续
+        if Subject.query.count() == 0:
+            for name in target_order:
                 db.session.add(Subject(name=name))
+            db.session.commit()
+            print(">> 科目表初始化完成，ID顺序已校准。")
 
         db.session.commit()
 
