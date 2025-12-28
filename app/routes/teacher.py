@@ -69,13 +69,11 @@ def get_my_courses(user_id):
 @teacher_bp.route("/score_list", methods=["GET"])
 def get_score_list():
     class_id = request.args.get("class_id")
-    # subject_id = request.args.get('subject_id') # 现在主要靠 task 确定科目，但保留校验也可以
-    exam_task_id = request.args.get("exam_task_id")  # 核心参数
+    exam_task_id = request.args.get("exam_task_id")
 
     if not exam_task_id:
         return jsonify([])
 
-    # 修正之前的bug：状态使用中文 '在读'
     students = Student.query.filter_by(class_id=class_id, status="在读").all()
 
     result = []
@@ -84,12 +82,21 @@ def get_score_list():
             student_id=s.id, exam_task_id=exam_task_id
         ).first()
 
+        # 默认显示逻辑
+        display_val = None
+        if score_record:
+            # 如果备注是缺考，优先返回字符串 "缺考"
+            if score_record.remark == "缺考":
+                display_val = "缺考"
+            else:
+                display_val = score_record.score
+
         result.append(
             {
                 "student_id": s.id,
                 "student_no": s.student_id,
                 "name": s.name,
-                "score": score_record.score if score_record else None,
+                "score": display_val,  # 前端直接接收 "缺考" 或 数字
             }
         )
 
@@ -101,8 +108,7 @@ def get_score_list():
 def save_scores():
     data = request.get_json()
     exam_task_id = data.get("exam_task_id")
-    subject_id = data.get("subject_id")  # 冗余字段，可用于校验
-    scores_data = data.get("scores")  # [{"student_id": 1, "score": 95}, ...]
+    scores_data = data.get("scores")  # [{"student_id": 1, "score": "缺考" 或 95}, ...]
 
     task = ExamTask.query.get(exam_task_id)
     if not task:
@@ -112,19 +118,43 @@ def save_scores():
         return jsonify({"msg": "该考试录入通道已关闭，无法保存"}), 403
 
     for item in scores_data:
+        raw_val = item["score"]
+
+        # 处理数值逻辑
+        final_score = 0.0
+        final_remark = ""
+
+        # 允许前端传 null 或 空串
+        if raw_val is None or raw_val == "":
+            # 如果是空，根据需求可能是不录入，或者归零。这里假设不做修改或设为0
+            # 简单起见，空值不更新，或者视为0
+            continue
+
+        if str(raw_val).strip() == "缺考":
+            final_score = 0.0
+            final_remark = "缺考"
+        else:
+            try:
+                final_score = float(raw_val)
+                final_remark = ""  # 正常分数清空备注
+            except ValueError:
+                continue  # 格式非法跳过
+
         existing_score = Score.query.filter_by(
             student_id=item["student_id"], exam_task_id=exam_task_id
         ).first()
 
         if existing_score:
-            existing_score.score = item["score"]
+            existing_score.score = final_score
+            existing_score.remark = final_remark
         else:
             new_score = Score(
                 student_id=item["student_id"],
-                subject_id=task.subject_id,  # 从任务中获取科目ID更安全
+                subject_id=task.subject_id,
                 exam_task_id=exam_task_id,
-                score=item["score"],
-                term=task.name,  # 兼容旧字段，存考试名
+                score=final_score,
+                term=task.name,
+                remark=final_remark,
             )
             db.session.add(new_score)
 
@@ -197,7 +227,12 @@ def export_scores():
 
     # 3. 获取已有成绩
     scores = Score.query.filter_by(exam_task_id=exam_task_id).all()
-    score_map = {s.student_id: s.score for s in scores}
+    score_map = {}
+    for s in scores:
+        if s.remark == "缺考":
+            score_map[s.student_id] = "缺考"
+        else:
+            score_map[s.student_id] = s.score
 
     # 4. 构造 DataFrame 数据
     data_list = []
@@ -331,9 +366,15 @@ def import_scores():
 
         # 4. 校验成绩格式
         score_val = 0.0
-        if raw_score == "":
-            # 空成绩暂且跳过，或视作不录入
-            continue
+        remark_val = ""
+        if raw_score == "" or pd.isna(raw_score):
+            continue  # 或根据需求处理
+
+        str_val = str(raw_score).strip()
+
+        if str_val == "缺考":
+            score_val = 0.0
+            remark_val = "缺考"
         else:
             try:
                 score_val = float(raw_score)
@@ -362,13 +403,13 @@ def import_scores():
         existing_score = Score.query.filter_by(
             student_id=student_obj.id, exam_task_id=exam_task_id
         ).first()
+
         if existing_score:
-            if existing_score.score != score_val:
+            # 更新逻辑：分数变了 OR 备注变了（例如从0分变缺考，或缺考变0分）
+            if existing_score.score != score_val or existing_score.remark != remark_val:
                 existing_score.score = score_val
+                existing_score.remark = remark_val
                 logs["updated"] += 1
-            else:
-                # 分数没变，但也算处理成功
-                pass
         else:
             new_score = Score(
                 student_id=student_obj.id,
@@ -376,6 +417,7 @@ def import_scores():
                 exam_task_id=task.id,
                 score=score_val,
                 term=task.name,
+                remark=remark_val,
             )
             db.session.add(new_score)
             logs["success"] += 1

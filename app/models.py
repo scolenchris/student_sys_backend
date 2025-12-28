@@ -187,6 +187,7 @@ class Score(db.Model):
     student_id = db.Column(db.Integer, db.ForeignKey("students.id"))
     subject_id = db.Column(db.Integer, db.ForeignKey("subjects.id"))
     score = db.Column(db.Float, default=0.0)
+    remark = db.Column(db.String(20), default="")
 
     # 关联具体的考试任务
     exam_task_id = db.Column(db.Integer, db.ForeignKey("exam_tasks.id"), nullable=True)

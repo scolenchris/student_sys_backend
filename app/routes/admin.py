@@ -439,10 +439,18 @@ def get_class_report():
         for sc in scores:
             sub_name = subject_map.get(sc.subject_id)
             if sub_name:
-                score_detail[sub_name] = sc.score
-                student_total += sc.score
-                # 累加到全班科目统计中
-                subject_stats[sub_name]["sum"] += sc.score
+                # 核心修改：如果是缺考，返回字符串
+                if sc.remark == "缺考":
+                    score_detail[sub_name] = "缺考"
+                    # 缺考算0分计入总分
+                    student_total += 0
+                else:
+                    score_detail[sub_name] = sc.score
+                    student_total += sc.score
+
+                # 统计平均分时，缺考通常也算作分母（视为0分），或者不计入？
+                # 这里保持原有逻辑：0分计入总分，count+1
+                subject_stats[sub_name]["sum"] += sc.score  # 缺考score是0
                 subject_stats[sub_name]["count"] += 1
 
         report_data.append(
@@ -568,19 +576,27 @@ def get_comprehensive_report():
             subj_id = task_map.get(sc.exam_task_id)
             subj_name = subject_name_map.get(subj_id)
             if subj_name:
-                stats_data[sid]["score_map"][subj_name] = sc.score
-                stats_data[sid]["total"] += sc.score
+                # 核心修改：存储用于展示的值
+                if sc.remark == "缺考":
+                    stats_data[sid]["score_map"][subj_name] = "缺考"
+                    # total 依然加 0
+                    stats_data[sid]["total"] += 0
+                else:
+                    stats_data[sid]["score_map"][subj_name] = sc.score
+                    stats_data[sid]["total"] += sc.score
 
     # 转换为列表以便排序
     result_list = list(stats_data.values())
 
     def sort_key(item):
         sm = item["score_map"]
-        # 构建比较元组: (总分, 语文分, 数学分, ...)
-        # 使用 get(name, 0) 处理缺考情况，默认为 0 分
         compare_tuple = [item["total"]]
         for sub in SUBJECT_PRIORITY:
-            compare_tuple.append(sm.get(sub, 0))
+            val = sm.get(sub, 0)
+            # 如果是 "缺考" 字符串，在排序时视为 0
+            if val == "缺考":
+                val = 0
+            compare_tuple.append(val)
         return tuple(compare_tuple)
 
     # --- 1. 计算级排名 (同时计算两种) ---
