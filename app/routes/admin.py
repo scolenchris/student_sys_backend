@@ -1327,3 +1327,101 @@ def export_course_assignments():
         download_name=filename,
         max_age=0,
     )
+
+
+# --- 9. 导出教师信息 Excel---
+@admin_bp.route("/teachers/export", methods=["GET"])
+def export_teachers():
+    # 1. 查询所有教师数据，预加载关联数据以提升性能
+    teachers = Teacher.query.all()
+
+    # 定义导出列头 (与导入模板保持一致)
+    columns = [
+        "工号",
+        "姓名",
+        "性别",
+        "电话",
+        "职称",
+        "班主任分配",
+        "级长分配",
+        "科组长分配",
+        "备课组长分配",
+        "任教分配",
+    ]
+
+    data_list = []
+
+    # 2. 遍历教师，构造数据行
+    for t in teachers:
+        # 获取关联的账号信息 (工号)
+        user = User.query.get(t.user_id)
+        username = user.username if user else ""
+
+        # A. 格式化班主任分配: "23级(01)班, 23级(02)班"
+        ht_list = [
+            h.class_info.full_name for h in t.head_teacher_assigns if h.class_info
+        ]
+        ht_str = "，".join(ht_list)
+
+        # B. 格式化级长分配: "2023级, 2024级"
+        gl_list = [f"{g.entry_year}级" for g in t.grade_leader_assigns]
+        gl_str = "，".join(gl_list)
+
+        # C. 格式化科组长分配: "语文, 数学"
+        sgl_list = [s.subject.name for s in t.subject_group_assigns if s.subject]
+        sgl_str = "，".join(sgl_list)
+
+        # D. 格式化备课组长分配: "2023级语文, 2024级数学"
+        pgl_list = []
+        for p in t.prep_group_assigns:
+            if p.subject:
+                pgl_list.append(f"{p.entry_year}级{p.subject.name}")
+        pgl_str = "，".join(pgl_list)
+
+        # E. 格式化任教分配: "23级(01)班-语文, 23级(02)班-数学"
+        course_list = []
+        for c in t.course_assignments:
+            if c.class_info and c.subject:
+                # 组合格式需与导入解析逻辑 split('-') 匹配
+                course_list.append(f"{c.class_info.full_name}-{c.subject.name}")
+        course_str = "，".join(course_list)
+
+        data_list.append(
+            {
+                "工号": username,
+                "姓名": t.name,
+                "性别": t.gender,
+                "电话": t.phone,
+                "职称": t.job_title,
+                "班主任分配": ht_str,
+                "级长分配": gl_str,
+                "科组长分配": sgl_str,
+                "备课组长分配": pgl_str,
+                "任教分配": course_str,
+            }
+        )
+
+    # 3. 生成 DataFrame
+    df = pd.DataFrame(data_list, columns=columns)
+
+    # 如果没有数据，pandas 也会生成一个只有表头的空文件，正好作为模板
+
+    # 4. 写入内存并返回
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="教师信息表")
+
+    output.seek(0)
+
+    filename = "教师信息表(模板_备份).xlsx"
+    from urllib.parse import quote
+
+    filename = quote(filename)
+
+    return send_file(
+        output,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=filename,
+        max_age=0,
+    )
