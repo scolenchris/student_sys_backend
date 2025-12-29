@@ -13,6 +13,12 @@ def create_app(config_class=Config):
     CORS(app)
     db.init_app(app)
 
+    @app.errorhandler(413)
+    def request_entity_too_large(error):
+        from flask import jsonify
+
+        return jsonify(msg="上传文件过大，请限制在 16MB 以内"), 413
+
     # 2. 注册蓝图 (待后续编写)
     from .routes.auth import auth_bp
     from .routes.admin import admin_bp
