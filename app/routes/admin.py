@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, send_file
 import pandas as pd
 import os
 from app.models import (
@@ -21,6 +21,7 @@ from app.models import (
 from sqlalchemy import func
 from datetime import datetime
 import re  # 引入正则模块用于校验
+import io
 
 admin_bp = Blueprint("admin", __name__)
 
@@ -1104,3 +1105,225 @@ def delete_exam_task(id):
         # 发生任何错误时回滚，保证数据一致性
         db.session.rollback()
         return jsonify({"msg": f"删除失败: {str(e)}"}), 500
+
+
+# [在 app/routes/admin.py 中添加]
+
+
+# --- 8. 批量导入任课信息 (新增功能) ---
+@admin_bp.route("/assignments/import", methods=["POST"])
+def import_course_assignments():
+    if "file" not in request.files:
+        return jsonify({"msg": "没有上传文件"}), 400
+
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"msg": "文件名为空"}), 400
+
+    try:
+        df = pd.read_excel(file)
+        df = df.fillna("")  # 填充空值
+    except Exception as e:
+        return jsonify({"msg": f"Excel读取失败: {str(e)}"}), 400
+
+    # 1. 预加载数据库数据 (构建映射字典以减少查询)
+    # 教师映射: { "张三": teacher_obj_id }
+    all_teachers = Teacher.query.all()
+    teacher_map = {t.name: t.id for t in all_teachers}
+
+    # 科目映射: { "语文": subject_id }
+    all_subjects = Subject.query.all()
+    subject_map = {s.name: s.id for s in all_subjects}
+
+    # 班级映射: 这里我们需要处理 "21级(01)班" 这种格式
+    # 构建一个临时 key: f"{short_year}级({class_num_str})班" -> class_id
+    all_classes = ClassInfo.query.all()
+    class_map = {}
+    for c in all_classes:
+        # 假设 entry_year 是 2021，截取后两位 "21"
+        short_year = str(c.entry_year)[-2:]
+        class_num_str = str(c.class_num).zfill(2)  # 补零，变成 "01"
+        key = f"{short_year}级({class_num_str})班"
+        class_map[key] = c.id
+
+    # 2. 核心校验：检查 Excel 中所有非空的教师姓名是否存在
+    missing_teachers = set()
+    errors = []
+
+    # 遍历 Excel 每一行
+    for index, row in df.iterrows():
+        row_num = index + 2
+
+        # 获取班级
+        class_name = str(row.get("班级名称", "")).strip()
+        if not class_name:
+            continue  # 跳过空行
+
+        if class_name not in class_map:
+            errors.append(
+                f"第 {row_num} 行：找不到班级 [{class_name}]，请检查格式是否为 xx级(xx)班"
+            )
+            continue
+
+        # 遍历该行的每一列 (排除 班级名称、人数 等非教师列)
+        for col_name in df.columns:
+            cell_value = str(row[col_name]).strip()
+            if not cell_value:
+                continue  # 空单元格跳过（符合“特定年级无该学科则留空”的规则）
+
+            # 判断列名是否涉及教师分配
+            is_subject = col_name in subject_map
+            is_head_teacher = col_name == "班主任"
+
+            if is_subject or is_head_teacher:
+                # 校验教师是否存在
+                if cell_value not in teacher_map:
+                    missing_teachers.add(cell_value)
+                    errors.append(
+                        f"第 {row_num} 行 [{col_name}]：教师 [{cell_value}] 在系统中不存在"
+                    )
+
+    # 3. 如果发现校验错误，立即中断并返回
+    if missing_teachers or errors:
+        msg = "导入失败，发现未知教师或数据错误。"
+        if missing_teachers:
+            msg += f" 以下教师未在系统中录入: {', '.join(missing_teachers)}。"
+        return jsonify({"msg": msg, "errors": errors}), 400
+
+    # 4. 数据写入 (校验通过后，执行写入)
+    success_count = 0
+    try:
+        for index, row in df.iterrows():
+            class_name = str(row.get("班级名称", "")).strip()
+            if not class_name or class_name not in class_map:
+                continue
+
+            class_id = class_map[class_name]
+
+            # 遍历列
+            for col_name in df.columns:
+                teacher_name = str(row[col_name]).strip()
+                if not teacher_name:
+                    continue
+
+                teacher_id = teacher_map.get(teacher_name)
+
+                # A. 处理班主任分配
+                if col_name == "班主任":
+                    # 先查询该班级是否已有班主任
+                    ht_assign = HeadTeacherAssignment.query.filter_by(
+                        class_id=class_id
+                    ).first()
+                    if ht_assign:
+                        ht_assign.teacher_id = teacher_id  # 更新
+                    else:
+                        new_ht = HeadTeacherAssignment(
+                            teacher_id=teacher_id, class_id=class_id
+                        )
+                        db.session.add(new_ht)
+
+                # B. 处理学科任教分配
+                elif col_name in subject_map:
+                    subject_id = subject_map[col_name]
+                    # 查询该班级+该科目是否已有分配
+                    course_assign = CourseAssignment.query.filter_by(
+                        class_id=class_id, subject_id=subject_id
+                    ).first()
+
+                    if course_assign:
+                        course_assign.teacher_id = teacher_id  # 更新任课老师
+                    else:
+                        new_ca = CourseAssignment(
+                            class_id=class_id,
+                            subject_id=subject_id,
+                            teacher_id=teacher_id,
+                        )
+                        db.session.add(new_ca)
+
+            success_count += 1
+
+        db.session.commit()
+        return jsonify({"msg": f"导入成功，已更新 {success_count} 个班级的任课信息"})
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"msg": f"数据库写入错误: {str(e)}"}), 500
+
+
+@admin_bp.route("/assignments/export", methods=["GET"])
+def export_course_assignments():
+    # 1. 准备基础数据：班级按年级班号排序，科目按ID排序
+    classes = ClassInfo.query.order_by(
+        ClassInfo.entry_year.desc(), ClassInfo.class_num.asc()
+    ).all()
+    subjects = Subject.query.order_by(Subject.id).all()
+
+    if not classes:
+        return jsonify({"msg": "暂无班级数据，请先在班级管理中创建班级"}), 400
+
+    # 2. 预查询现有数据（为了填充备份）
+    # 获取所有班主任分配: { class_id: teacher_name }
+    ht_assigns = HeadTeacherAssignment.query.all()
+    ht_map = {ht.class_id: ht.teacher.name for ht in ht_assigns if ht.teacher}
+
+    # 获取所有科任分配: { (class_id, subject_id): teacher_name }
+    course_assigns = CourseAssignment.query.all()
+    ca_map = {
+        (ca.class_id, ca.subject_id): ca.teacher.name
+        for ca in course_assigns
+        if ca.teacher
+    }
+
+    # 3. 构建 Excel 数据行
+    data_list = []
+
+    for cls in classes:
+        # 构造标准的班级名称格式，如 "23级(01)班"
+        # 确保这个格式与导入功能的解析正则 r"(\d+)级\((\d+)\)班" 完美匹配
+        short_year = str(cls.entry_year)[-2:]
+        class_num_str = str(cls.class_num).zfill(2)
+        class_name_str = f"{short_year}级({class_num_str})班"
+
+        row = {
+            "班级名称": class_name_str,
+            "人数": cls.students.count(),  # 顺便导出人数供参考（导入时会自动忽略此列）
+            "班主任": ht_map.get(cls.id, ""),  # 如果没数据就是空字符串（即空模板）
+        }
+
+        # 动态填充每一科的老师
+        for sub in subjects:
+            # 尝试获取该班该科的老师，没有则是空
+            row[sub.name] = ca_map.get((cls.id, sub.id), "")
+
+        data_list.append(row)
+
+    # 4. 生成 DataFrame
+    df = pd.DataFrame(data_list)
+
+    # 强制设定列顺序：班级名称 -> 人数 -> 班主任 -> 语文 -> 数学 ...
+    # 这样生成的模板非常直观
+    column_order = ["班级名称", "人数", "班主任"] + [s.name for s in subjects]
+
+    # 防止因数据为空导致列丢失，重新索引
+    df = df.reindex(columns=column_order)
+
+    # 5. 写入内存并返回
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="任课总表")
+
+    output.seek(0)
+
+    # 文件名加时间戳或简单命名均可
+    filename = "任课分配表(导入模板_备份).xlsx"
+    from urllib.parse import quote
+
+    filename = quote(filename)  # 处理中文文件名
+
+    return send_file(
+        output,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=filename,
+        max_age=0,
+    )
