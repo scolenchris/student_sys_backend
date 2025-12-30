@@ -1,22 +1,25 @@
 import os
 
+# 获取当前文件所在的目录绝对路径，用于定位 SQLite 数据库文件
+basedir = os.path.abspath(os.path.dirname(__file__))
+
 
 class Config:
     # 基础安全配置
     SECRET_KEY = os.environ.get("SECRET_KEY") or "student-sys-secret-123456"
     MAX_CONTENT_LENGTH = 16 * 1024 * 1024
-    # MySQL 数据库配置
-    # 格式: mysql+pymysql://用户名:密码@主机地址:端口/数据库名?charset=utf8mb4
-    # utf8mb4 确保能支持中文姓名及特殊字符
-    SQLALCHEMY_DATABASE_URI = (
-        "mysql+pymysql://root:@localhost:3306/school_db?charset=utf8mb4"
-    )
+
+    # --- 数据库配置 (已切换为 SQLite) ---
+    # 数据库文件 'school.db' 将生成在后端项目根目录下
+    SQLALCHEMY_DATABASE_URI = "sqlite:///" + os.path.join(basedir, "school.db")
 
     # 性能优化配置
-    SQLALCHEMY_TRACK_MODIFICATIONS = False  # 禁用追踪以节省内存和性能
+    SQLALCHEMY_TRACK_MODIFICATIONS = False  # 禁用追踪以节省内存
+
+    # SQLite 配置项
+    # 注意：SQLite 通常不需要 MySQL 的 pool_recycle 配置
     SQLALCHEMY_ENGINE_OPTIONS = {
-        "pool_recycle": 3600,  # 1小时重连一次，防止 MySQL 自动断开
-        "pool_pre_ping": True,  # 每次请求前检查连接是否可用
+        "pool_pre_ping": True,
     }
 
     # JWT 或 Session 过期时间设置（可选）
