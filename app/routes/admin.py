@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify, send_file
+from flask import Blueprint, request, jsonify, send_file, current_app
 import pandas as pd
 import os
 from app.models import (
@@ -22,6 +22,7 @@ from sqlalchemy import func
 from datetime import datetime
 import re  # 引入正则模块用于校验
 import io
+from docxtpl import DocxTemplate
 
 admin_bp = Blueprint("admin", __name__)
 
@@ -1425,3 +1426,84 @@ def export_teachers():
         download_name=filename,
         max_age=0,
     )
+
+
+@admin_bp.route("/students/<int:student_id>/certificate", methods=["GET"])
+def generate_certificate(student_id):
+    # 1. 查询数据
+    student = Student.query.get(student_id)
+    if not student:
+        return jsonify({"msg": "学生不存在"}), 404
+
+    # 2. 数据处理
+    # 班级信息处理
+    entry_year = "____"
+    class_num = "__"
+    if student.current_class_rel:
+        entry_year = str(student.current_class_rel.entry_year)
+        class_num = str(student.current_class_rel.class_num)
+
+    # 学籍号处理：优先显示市学籍号，没有则显示国家学籍号，都没有显示暂无
+    school_id = student.city_school_id or student.national_school_id or "暂无数据"
+
+    # 身份证处理
+    id_card = student.id_card_number or "暂无数据"
+
+    # 获取当前日期
+    now = datetime.now()
+
+    # 3. 构建模板上下文 (Context)
+    # 这里的 key 必须和 Word 模板里的 {{ key }} 一一对应
+    context = {
+        "name": student.name,
+        "gender": student.gender,
+        "entry_year": entry_year,  # 入学年份，如 2025
+        "class_num": class_num,  # 班号，如 3
+        "status": student.status,  # 在读
+        "school_id": school_id,  # 学籍号
+        "id_card": id_card,  # 身份证
+        "year": now.year,  # 年
+        "month": now.month,  # 月
+        "day": now.day,  # 日
+    }
+
+    # 4. 加载模板
+    # 假设模板放在后端项目根目录下
+    template_name = "certificate_template.docx"
+    # 获取绝对路径，防止路径错误
+    base_dir = os.path.abspath(os.path.dirname(__file__))  # app/routes
+    # 回退两级找到项目根目录 (根据你的项目结构调整，通常在 run.py 同级)
+    root_dir = os.path.abspath(os.path.join(base_dir, "..", ".."))
+    template_path = os.path.join(root_dir, template_name)
+
+    if not os.path.exists(template_path):
+        print(f"模板未找到: {template_path}")
+        return (
+            jsonify({"msg": "服务器端缺少证书模板文件(certificate_template.docx)"}),
+            500,
+        )
+
+    try:
+        tpl = DocxTemplate(template_path)
+        tpl.render(context)
+
+        # 5. 写入内存
+        file_stream = io.BytesIO()
+        tpl.save(file_stream)
+        file_stream.seek(0)
+
+        # 6. 生成文件名
+        filename = f"{student.name}_学籍证明.docx"
+        from urllib.parse import quote
+
+        filename = quote(filename)
+
+        return send_file(
+            file_stream,
+            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            as_attachment=True,
+            download_name=filename,
+        )
+    except Exception as e:
+        print(f"生成错误: {str(e)}")
+        return jsonify({"msg": f"生成证明文件失败: {str(e)}"}), 500
