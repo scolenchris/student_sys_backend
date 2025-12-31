@@ -24,11 +24,6 @@ def get_my_courses(user_id):
         return jsonify([]), 200  # 如果没找到教师档案，返回空列表
 
     # 查询关联的班级和科目
-    # assignments = db.session.query(CourseAssignment, ClassInfo, Subject).join(
-    #     ClassInfo, CourseAssignment.class_id == ClassInfo.id
-    # ).join(
-    #     Subject, CourseAssignment.subject_id == Subject.id
-    # ).filter(CourseAssignment.teacher_id == teacher.id).all()
     assignments = (
         db.session.query(
             CourseAssignment.id,
@@ -44,13 +39,6 @@ def get_my_courses(user_id):
         .all()
     )
 
-    # return jsonify([{
-    #     "assignment_id": a.CourseAssignment.id,
-    #     "class_id": a.ClassInfo.id,
-    #     "grade_class": f"{a.ClassInfo.grade_display}({a.ClassInfo.class_num})班",
-    #     "subject_name": a.Subject.name,
-    #     "subject_id": a.Subject.id
-    # } for a in assignments])
     return jsonify(
         [
             {
@@ -198,8 +186,6 @@ def get_available_exams():
 
 
 # --- 5. 导出成绩单/录入模板 (XLSX格式) ---
-
-
 @teacher_bp.route("/export_scores", methods=["GET"])
 def export_scores():
     exam_task_id = request.args.get("exam_task_id", type=int)
@@ -240,7 +226,7 @@ def export_scores():
         row = {
             "学号": s.student_id,
             "姓名": s.name,
-            "班级名称": formatted_class_name,  # 【修改点 2】使用上面构造的格式
+            "班级名称": formatted_class_name,
             "状态": s.status,
             subject_name: score_map.get(s.id, ""),
         }
@@ -271,7 +257,7 @@ def export_scores():
     )
 
 
-# --- 6. Excel 批量导入成绩 (含详细错误处理) ---
+# --- 6. Excel 批量导入成绩 (含详细错误处理与严格校验) ---
 @teacher_bp.route("/import_scores", methods=["POST"])
 def import_scores():
     if "file" not in request.files:
@@ -285,60 +271,102 @@ def import_scores():
         return jsonify({"msg": "缺少任务ID或班级ID"}), 400
 
     task = ExamTask.query.get(exam_task_id)
-    if not task:
-        return jsonify({"msg": "考试任务不存在"}), 404
+    cls = ClassInfo.query.get(class_id)
+    if not task or not cls:
+        return jsonify({"msg": "考试任务或班级不存在"}), 404
 
     if not task.is_active:
         return jsonify({"msg": "该考试已锁定，禁止导入"}), 403
 
-    subject_name = task.subject.name  # 必须匹配的列名
+    subject_name = task.subject.name  # 当前要录入的科目名
+
+    # 构造预期的班级名称格式，用于严格校验
+    short_year = str(cls.entry_year)[-2:]
+    expected_class_name = f"{short_year}级({cls.class_num})班"
 
     try:
         df = pd.read_excel(file)
-        df.fillna("", inplace=True)  # 填充空值为字符串，防止 NaN 报错
+        df.fillna("", inplace=True)  # 填充空值为字符串
     except Exception as e:
         return jsonify({"msg": f"Excel读取失败: {str(e)}"}), 400
 
-    # --- 校验表头 ---
-    required_cols = ["学号", "姓名", subject_name]
+    # --- 1. 严格校验表头 ---
+    # 必须包含 "班级名称", "学号", "姓名" 以及 当前科目
+    required_cols = ["学号", "姓名", "班级名称", subject_name]
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
-        return jsonify({"msg": f"Excel格式错误，缺少列: {','.join(missing_cols)}"}), 400
-
-    # --- 准备对比数据 ---
-    # 获取系统中该班级的所有学生 {student_id_str: student_obj}
-    db_students = Student.query.filter_by(class_id=class_id, status="在读").all()
-    db_student_map = {s.student_id: s for s in db_students}
+        return (
+            jsonify({"msg": f"Excel格式错误，缺少必要列: {','.join(missing_cols)}"}),
+            400,
+        )
 
     # 记录日志
     logs = {"success": 0, "updated": 0, "errors": []}  # 格式: {"row": 1, "msg": "..."}
 
+    # --- 2. 检查是否有“多余”的科目列 ---
+    # 获取系统中所有科目名称
+    all_subjects = Subject.query.all()
+    all_subject_names = set(s.name for s in all_subjects)
+
+    # 找出 Excel 中存在，且属于系统科目，但不是当前录入科目的列
+    # 比如当前录“语文”，但表里还有“数学”
+    extra_subjects = [
+        col for col in df.columns if col in all_subject_names and col != subject_name
+    ]
+
+    if extra_subjects:
+        logs["errors"].append(
+            {
+                "row": "全局警报",
+                "name": "-",
+                "msg": f"检测到多余的科目数据列: [{', '.join(extra_subjects)}]。为了安全起见，只读取 [{subject_name}]，其余科目数据已被忽略。",
+            }
+        )
+
+    # --- 3. 准备对比数据 ---
+    # 获取系统中该班级的所有学生 {student_id_str: student_obj}
+    db_students = Student.query.filter_by(class_id=class_id, status="在读").all()
+    db_student_map = {s.student_id: s for s in db_students}
+
     processed_student_ids = set()  # 记录 Excel 中出现的有效系统学号
 
-    # --- 遍历 Excel 行 ---
+    # --- 4. 遍历 Excel 行 ---
     for index, row in df.iterrows():
-        excel_row_num = index + 2  # Excel 行号从 2 开始 (1是表头)
+        excel_row_num = index + 2  # Excel 行号从 2 开始
 
         s_id = str(row["学号"]).strip()
         s_name = str(row["姓名"]).strip()
-        # 获取成绩，可能是数字或字符串
+        row_class_name = str(row["班级名称"]).strip()
         raw_score = row[subject_name]
 
-        # 1. 检查空行
+        # 空行跳过
         if not s_id:
             continue
 
-        # 2. 检查 Excel 中的学生是否存在于 系统当前班级
+        # A. 校验班级名称是否匹配
+        # 这里进行简单兼容：如果 Excel 是 "23级(1)班" 而 系统期望 "23级(01)班"，也视作不匹配，要求严格一致
+        if row_class_name != expected_class_name:
+            logs["errors"].append(
+                {
+                    "row": excel_row_num,
+                    "name": s_name,
+                    "msg": f"班级不匹配: Excel中为 [{row_class_name}]，应为 [{expected_class_name}]",
+                }
+            )
+            continue
+
+        # B. 检查学生是否存在于当前班级 (db_student_map 只包含本班学生)
         if s_id not in db_student_map:
-            # 错误情形：Excel里有，但系统班级里没有 (可能是转走了，或者是别的班的)
-            # 尝试去全局查一下，看是不是别的班的
+            # 尝试去全局查一下，明确报错原因
             other_student = Student.query.filter_by(student_id=s_id).first()
             if other_student:
+                current_cls = other_student.current_class_rel
+                c_name = current_cls.full_name if current_cls else "未知"
                 logs["errors"].append(
                     {
                         "row": excel_row_num,
                         "name": s_name,
-                        "msg": f"该生在系统中属于 {other_student.current_class_rel.full_name}，非当前班级",
+                        "msg": f"非本班学生 (该生属于 {c_name})，已忽略",
                     }
                 )
             else:
@@ -346,29 +374,30 @@ def import_scores():
                     {
                         "row": excel_row_num,
                         "name": s_name,
-                        "msg": "系统中未找到该学号（非本班学生）",
+                        "msg": "系统中不存在该学号，已忽略",
                     }
                 )
             continue
 
         student_obj = db_student_map[s_id]
 
-        # 3. 校验姓名是否匹配 (防止学号填错导致张冠李戴)
+        # C. 校验姓名是否匹配 (防止学号填错)
         if student_obj.name != s_name:
             logs["errors"].append(
                 {
                     "row": excel_row_num,
                     "name": s_name,
-                    "msg": f"学号与姓名不匹配，系统记录为: {student_obj.name}",
+                    "msg": f"姓名与学号不匹配，系统记录为: {student_obj.name}",
                 }
             )
             continue
 
-        # 4. 校验成绩格式
+        # D. 校验成绩格式
         score_val = 0.0
         remark_val = ""
         if raw_score == "" or pd.isna(raw_score):
-            continue  # 或根据需求处理
+            # 空值跳过，不覆盖已有成绩
+            continue
 
         str_val = str(raw_score).strip()
 
@@ -405,7 +434,6 @@ def import_scores():
         ).first()
 
         if existing_score:
-            # 更新逻辑：分数变了 OR 备注变了（例如从0分变缺考，或缺考变0分）
             if existing_score.score != score_val or existing_score.remark != remark_val:
                 existing_score.score = score_val
                 existing_score.remark = remark_val
@@ -422,15 +450,25 @@ def import_scores():
             db.session.add(new_score)
             logs["success"] += 1
 
-    # --- 5. 循环结束后，检查缺失人员 ---
-    # (即：系统里有，但 Excel 里没出现的学生)
+    # --- 5. 检查本班名单中缺失的人员 (在班里但 Excel 没填) ---
     all_db_ids = set(db_student_map.keys())
     missing_ids = all_db_ids - processed_student_ids
 
-    for mid in missing_ids:
-        missing_stu = db_student_map[mid]
+    # 只是记录一下，不算作错误，也许老师就是只想录入一部分
+    # 但如果为了严格提示，也可以加到 errors 里作为 Info
+    if missing_ids:
+        missing_names = [db_student_map[mid].name for mid in missing_ids]
+        # 只取前5个名字展示，避免太长
+        show_names = ",".join(missing_names[:5])
+        if len(missing_names) > 5:
+            show_names += f" 等{len(missing_names)}人"
+
         logs["errors"].append(
-            {"row": "-", "name": missing_stu.name, "msg": "Excel 中缺失该学生成绩"}
+            {
+                "row": "-",
+                "name": "-",
+                "msg": f"提示: 本班还有 {len(missing_names)} 人未包含在Excel中 ({show_names})，未更新其成绩",
+            }
         )
 
     try:
@@ -440,8 +478,8 @@ def import_scores():
         return jsonify({"msg": f"数据库写入失败: {str(e)}"}), 500
 
     # 构造返回信息
-    msg = f"处理完成。新增: {logs['success']}，更新: {logs['updated']}。"
+    msg = f"处理完成。成功录入: {logs['success']}，更新: {logs['updated']}。"
     if logs["errors"]:
-        msg += f" 发现 {len(logs['errors'])} 个问题，请查看详情。"
+        msg += f" 发现 {len(logs['errors'])} 个问题/提示，请务必查看详情。"
 
     return jsonify({"msg": msg, "logs": logs})
