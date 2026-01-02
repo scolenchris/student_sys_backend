@@ -1507,3 +1507,151 @@ def generate_certificate(student_id):
     except Exception as e:
         print(f"生成错误: {str(e)}")
         return jsonify({"msg": f"生成证明文件失败: {str(e)}"}), 500
+
+
+@admin_bp.route("/stats/class_score_stats", methods=["POST"])
+def get_class_score_stats():
+    data = request.get_json()
+    entry_year = data.get("entry_year")
+    exam_name = data.get("exam_name")
+    subject_ids = data.get("subject_ids", [])
+
+    # 获取阈值设置 (前端传百分比整数，如 85，需转换为 0.85)
+    # 默认值：优秀 85%, 合格 60%, 低分 30%
+    th_exc = data.get("threshold_excellent", 85) / 100.0
+    th_pass = data.get("threshold_pass", 60) / 100.0
+    th_low = data.get("threshold_low", 30) / 100.0
+
+    if not entry_year or not exam_name or not subject_ids:
+        return jsonify({"msg": "请选择完整的筛选条件"}), 400
+
+    # 1. 获取符合条件的考试任务 (用于确定满分值和关联的科目)
+    tasks = ExamTask.query.filter(
+        ExamTask.entry_year == entry_year,
+        ExamTask.name == exam_name,
+        ExamTask.subject_id.in_(subject_ids),
+    ).all()
+
+    if not tasks:
+        return jsonify([])
+
+    # 计算所选科目的满分总和
+    full_score_sum = sum(t.full_score for t in tasks)
+    task_ids = [t.id for t in tasks]
+
+    # 获取涉及的科目名称 (去重并排序)
+    subject_names = sorted(list(set([t.subject.name for t in tasks])))
+    subjects_display = "、".join(subject_names)
+
+    # 2. 获取该年级所有班级
+    classes = (
+        ClassInfo.query.filter_by(entry_year=entry_year)
+        .order_by(ClassInfo.class_num)
+        .all()
+    )
+    class_ids = [c.id for c in classes]
+
+    # 3. 获取所有相关学生 (状态为在读)
+    students = Student.query.filter(
+        Student.class_id.in_(class_ids), Student.status == "在读"
+    ).all()
+    student_class_map = {s.id: s.class_id for s in students}
+
+    # 4. 获取所有相关成绩
+    scores = Score.query.filter(
+        Score.exam_task_id.in_(task_ids), Score.student_id.in_([s.id for s in students])
+    ).all()
+
+    # --- 数据处理 ---
+    # 结构: student_id -> { total: 0, valid_subjects: 0 }
+    student_stats = {s.id: {"total": 0, "valid_subjects": 0} for s in students}
+
+    for sc in scores:
+        sid = sc.student_id
+        if sid in student_stats:
+            # 只有非"缺考"才计入有效科目数和总分
+            # 注意：如果您的需求是"缺考算0分但不算缺考人数"，逻辑需微调
+            # 这里按照通常逻辑：有分数的才算"考试人数"
+            if sc.remark != "缺考":
+                student_stats[sid]["total"] += sc.score
+                student_stats[sid]["valid_subjects"] += 1
+            else:
+                # 缺考时，总分加0，valid_subjects 不加
+                pass
+
+    # 计算级平均分 (仅基于"考试人数"，即至少有一科有效成绩的学生)
+    grade_total_score = 0
+    grade_exam_count = 0
+
+    # 筛选出有效考生数据 (valid_subjects > 0)
+    valid_student_data = []
+    for sid, stat in student_stats.items():
+        if stat["valid_subjects"] > 0:
+            grade_total_score += stat["total"]
+            grade_exam_count += 1
+            valid_student_data.append(
+                {"class_id": student_class_map[sid], "total": stat["total"]}
+            )
+
+    grade_avg = grade_total_score / grade_exam_count if grade_exam_count > 0 else 0
+
+    # 5. 按班级聚合统计
+    result = []
+
+    for cls in classes:
+        # 获取本班的所有学生ID
+        cls_student_ids = [s.id for s in cls.students if s.status == "在读"]
+        total_people = len(cls_student_ids)
+
+        # 获取本班的"有效考生"数据
+        cls_valid_data = [d for d in valid_student_data if d["class_id"] == cls.id]
+        cls_exam_scores = [d["total"] for d in cls_valid_data]
+        exam_people = len(cls_exam_scores)
+
+        # 初始化统计数据
+        cls_sum = sum(cls_exam_scores)
+        cls_avg = cls_sum / exam_people if exam_people > 0 else 0
+        cls_max = max(cls_exam_scores) if exam_people > 0 else 0
+        cls_min = min(cls_exam_scores) if exam_people > 0 else 0
+
+        # 阈值统计
+        # 优秀: >= 满分 * 85%
+        cnt_exc = sum(1 for s in cls_exam_scores if s >= full_score_sum * th_exc)
+        # 合格: >= 满分 * 60%
+        cnt_pass = sum(1 for s in cls_exam_scores if s >= full_score_sum * th_pass)
+        # 低分: <= 满分 * 30%
+        cnt_low = sum(1 for s in cls_exam_scores if s <= full_score_sum * th_low)
+        # 不合格: < 合格线 (即 总人数 - 合格人数，或者严格小于)
+        # 这里使用严格小于逻辑：
+        cnt_fail = sum(1 for s in cls_exam_scores if s < full_score_sum * th_pass)
+
+        # 计算与级比率 (班均 / 级均)
+        ratio = (cls_avg / grade_avg * 100) if grade_avg > 0 else 0
+
+        def calc_rate(cnt, total):
+            return round(cnt / total * 100, 1) if total > 0 else 0
+
+        result.append(
+            {
+                "class_name": cls.full_name,
+                "subjects": subjects_display,
+                "full_score": full_score_sum,
+                "total_people": total_people,
+                "exam_people": exam_people,
+                "excellent_count": cnt_exc,
+                "excellent_rate": calc_rate(cnt_exc, exam_people),
+                "pass_count": cnt_pass,
+                "pass_rate": calc_rate(cnt_pass, exam_people),
+                "fail_count": cnt_fail,
+                "fail_rate": calc_rate(cnt_fail, exam_people),
+                "low_count": cnt_low,
+                "low_rate": calc_rate(cnt_low, exam_people),
+                "max_score": cls_max,
+                "min_score": cls_min,
+                "sum_score": cls_sum,
+                "avg_score": round(cls_avg, 1),
+                "grade_ratio": round(ratio, 1),
+            }
+        )
+
+    return jsonify(result)
