@@ -89,49 +89,75 @@ def reject_user(user_id):
 # --- 2. 教师管理模块 ---
 @admin_bp.route("/teachers", methods=["GET"])
 def get_teachers():
-    teachers = (
-        db.session.query(Teacher, User)
-        .join(User, Teacher.user_id == User.id)
-        .filter(User.is_approved == True)
-        .all()
-    )
+    # 1. 获取筛选参数
+    current_year = datetime.now().year
+    # 默认查看当前学年 (如 2025年2月 -> 2024学年)
+    default_year = current_year if datetime.now().month >= 9 else current_year - 1
+
+    academic_year = request.args.get("academic_year", default_year, type=int)
+    status_filter = request.args.get("status", "在职")  # 默认只看在职
+
+    # 2. 查询教师基础信息
+    query = db.session.query(Teacher, User).join(User, Teacher.user_id == User.id)
+
+    if status_filter != "全部":
+        query = query.filter(Teacher.status == status_filter)
+
+    teachers = query.all()
 
     result = []
     for t, u in teachers:
-        # 1. 班主任信息聚合
+        # --- 核心修改：只聚合指定学年的职务信息 ---
+
+        # 1. 班主任 (带年份过滤)
         ht_list = [
-            h.class_info.full_name for h in t.head_teacher_assigns if h.class_info
+            h.class_info.full_name
+            for h in t.head_teacher_assigns
+            if h.academic_year == academic_year and h.class_info
         ]
         ht_str = "、".join(ht_list) if ht_list else "否"
 
-        # 2. 级长信息聚合
-        gl_list = [g.grade_name for g in t.grade_leader_assigns]
+        # 2. 级长 (带年份过滤)
+        gl_list = [
+            g.grade_name
+            for g in t.grade_leader_assigns
+            if g.academic_year == academic_year
+        ]
         gl_str = "、".join(gl_list) if gl_list else "否"
 
-        # 3. 科组长信息聚合
-        sgl_list = [s.subject.name for s in t.subject_group_assigns if s.subject]
+        # 3. 科组长 (带年份过滤)
+        sgl_list = [
+            s.subject.name
+            for s in t.subject_group_assigns
+            if s.academic_year == academic_year and s.subject
+        ]
         sgl_str = "、".join(sgl_list) if sgl_list else "否"
 
-        # 4. 备课组长信息聚合
+        # 4. 备课组长 (带年份过滤)
         pgl_list = [
-            f"{p.grade_name}{p.subject.name}" for p in t.prep_group_assigns if p.subject
+            f"{p.grade_name}{p.subject.name}"
+            for p in t.prep_group_assigns
+            if p.academic_year == academic_year and p.subject
         ]
         pgl_str = "、".join(pgl_list) if pgl_list else "否"
 
-        # 5. 任教信息聚合 (任教级、任教班、任教学科)
-        courses = t.course_assignments
+        # 5. 任教信息 (带年份过滤)
+        # 注意：这里展示的是该老师在该学年的教学任务
+        my_courses = [
+            c for c in t.course_assignments if c.academic_year == academic_year
+        ]
+
         teaching_grades = sorted(
-            list(set([c.class_info.grade_display for c in courses if c.class_info]))
+            list(set([c.class_info.grade_display for c in my_courses if c.class_info]))
         )
         teaching_classes = sorted(
-            list(set([c.class_info.full_name for c in courses if c.class_info]))
+            list(set([c.class_info.full_name for c in my_courses if c.class_info]))
         )
         teaching_subjects = sorted(
-            list(set([c.subject.name for c in courses if c.subject]))
+            list(set([c.subject.name for c in my_courses if c.subject]))
         )
 
         # 构造职务显示字符串
-        # 简单的逻辑：如果有具体职务，显示职务名，否则显示“科任”
         duty_parts = []
         if ht_list:
             duty_parts.append("班主任")
@@ -142,7 +168,7 @@ def get_teachers():
         if pgl_list:
             duty_parts.append("备课组长")
         if not duty_parts:
-            duty_parts.append("科任")  # 默认
+            duty_parts.append("科任")
 
         result.append(
             {
@@ -151,28 +177,17 @@ def get_teachers():
                 "name": t.name,
                 "gender": t.gender,
                 "ethnicity": t.ethnicity,
-                "status": t.status,
-                "job_duty_display": "、".join(
-                    duty_parts
-                ),  # 职务概要 (如: 班主任、级长)
+                "status": t.status,  # 这里的状态是当前的最新状态
+                "job_duty_display": "、".join(duty_parts),  # 职务是指定学年的
                 "job_title": t.job_title,
                 "education": t.education,
                 "major": t.major,
                 "phone": t.phone,
-                # 详细职务描述 (用于Tooltip或详情)
+                # 详细描述
                 "head_teacher_desc": ht_str,
                 "grade_leader_desc": gl_str,
                 "subject_group_desc": sgl_str,
                 "prep_group_desc": pgl_str,
-                # 供编辑回显用的ID列表
-                "head_teacher_ids": [h.class_id for h in t.head_teacher_assigns],
-                "grade_leader_years": [g.entry_year for g in t.grade_leader_assigns],
-                "subject_group_ids": [s.subject_id for s in t.subject_group_assigns],
-                # 备课组长比较复杂，存对象结构
-                "prep_group_data": [
-                    {"entry_year": p.entry_year, "subject_id": p.subject_id}
-                    for p in t.prep_group_assigns
-                ],
                 # 教学情况
                 "teaching_grades": (
                     "、".join(teaching_grades) if teaching_grades else "-"
@@ -186,6 +201,7 @@ def get_teachers():
                 "remarks": t.remarks,
             }
         )
+
     return jsonify(result)
 
 
@@ -196,7 +212,17 @@ def update_teacher(t_id):
     if not teacher:
         return jsonify({"msg": "找不到该教师"}), 404
 
-    # 1. 更新基础信息
+    # --- 0. 确定操作的学年 ---
+    # 如果前端在编辑时传入了 academic_year，则更新那一年的职务
+    # 否则默认更新当前学年 (9月为界)
+    req_year = data.get("academic_year")
+    if req_year:
+        target_year = int(req_year)
+    else:
+        now = datetime.now()
+        target_year = now.year if now.month >= 9 else now.year - 1
+
+    # --- 1. 更新基础信息 (全局有效，不分年份) ---
     teacher.name = data.get("name", teacher.name)
     teacher.gender = data.get("gender", teacher.gender)
     teacher.ethnicity = data.get("ethnicity", teacher.ethnicity)
@@ -207,34 +233,51 @@ def update_teacher(t_id):
     teacher.major = data.get("major", teacher.major)
     teacher.remarks = data.get("remarks", teacher.remarks)
 
-    # 2. 更新班主任 (全删全加策略，简单可靠)
-    # 前端传 head_teacher_ids: [1, 2]
-    HeadTeacherAssignment.query.filter_by(teacher_id=teacher.id).delete()
+    # --- 2. 更新职务 (严格限定在 target_year) ---
+
+    # A. 更新班主任
+    # 先只删该学年的
+    HeadTeacherAssignment.query.filter_by(
+        teacher_id=teacher.id, academic_year=target_year
+    ).delete()
     if "head_teacher_ids" in data:
         for cid in data["head_teacher_ids"]:
-            db.session.add(HeadTeacherAssignment(teacher_id=teacher.id, class_id=cid))
+            db.session.add(
+                HeadTeacherAssignment(
+                    teacher_id=teacher.id,
+                    class_id=cid,
+                    academic_year=target_year,  # 写入学年
+                )
+            )
 
-    # 3. 更新级长
-    # 前端传 grade_leader_years: [2023, 2024]
-    GradeLeaderAssignment.query.filter_by(teacher_id=teacher.id).delete()
+    # B. 更新级长
+    GradeLeaderAssignment.query.filter_by(
+        teacher_id=teacher.id, academic_year=target_year
+    ).delete()
     if "grade_leader_years" in data:
         for year in data["grade_leader_years"]:
             db.session.add(
-                GradeLeaderAssignment(teacher_id=teacher.id, entry_year=year)
+                GradeLeaderAssignment(
+                    teacher_id=teacher.id, entry_year=year, academic_year=target_year
+                )
             )
 
-    # 4. 更新科组长
-    # 前端传 subject_group_ids: [1]
-    SubjectGroupLeaderAssignment.query.filter_by(teacher_id=teacher.id).delete()
+    # C. 更新科组长
+    SubjectGroupLeaderAssignment.query.filter_by(
+        teacher_id=teacher.id, academic_year=target_year
+    ).delete()
     if "subject_group_ids" in data:
         for sid in data["subject_group_ids"]:
             db.session.add(
-                SubjectGroupLeaderAssignment(teacher_id=teacher.id, subject_id=sid)
+                SubjectGroupLeaderAssignment(
+                    teacher_id=teacher.id, subject_id=sid, academic_year=target_year
+                )
             )
 
-    # 5. 更新备课组长
-    # 前端传 prep_group_data: [{"entry_year": 2023, "subject_id": 1}, ...]
-    PrepGroupLeaderAssignment.query.filter_by(teacher_id=teacher.id).delete()
+    # D. 更新备课组长
+    PrepGroupLeaderAssignment.query.filter_by(
+        teacher_id=teacher.id, academic_year=target_year
+    ).delete()
     if "prep_group_data" in data:
         for item in data["prep_group_data"]:
             if item.get("entry_year") and item.get("subject_id"):
@@ -243,11 +286,12 @@ def update_teacher(t_id):
                         teacher_id=teacher.id,
                         entry_year=item["entry_year"],
                         subject_id=item["subject_id"],
+                        academic_year=target_year,
                     )
                 )
 
     db.session.commit()
-    return jsonify({"msg": "教师信息更新成功"})
+    return jsonify({"msg": f"教师信息已更新 (针对 {target_year} 学年)"})
 
 
 # 重置教师密码
@@ -676,20 +720,30 @@ def get_comprehensive_report():
 
 @admin_bp.route("/assignments", methods=["GET"])
 def get_assignments():
-    # 联表查询，获取 老师名、班级名、科目名
-    results = (
+    # 1. 获取前端传来的学年参数
+    academic_year = request.args.get("academic_year", type=int)
+
+    # 2. 构建基础查询
+    query = (
         db.session.query(
             CourseAssignment.id,
             Teacher.name.label("teacher_name"),
             ClassInfo.entry_year,
             ClassInfo.class_num,
             Subject.name.label("subject_name"),
+            # 如果需要，也可以把 academic_year 查出来
         )
         .join(Teacher, CourseAssignment.teacher_id == Teacher.id)
         .join(ClassInfo, CourseAssignment.class_id == ClassInfo.id)
         .join(Subject, CourseAssignment.subject_id == Subject.id)
-        .all()
     )
+
+    # 3. [关键] 如果有学年参数，增加筛选条件
+    if academic_year:
+        query = query.filter(CourseAssignment.academic_year == academic_year)
+
+    # 4. 执行查询
+    results = query.all()
 
     return jsonify(
         [
@@ -854,122 +908,126 @@ def import_teachers_excel():
         return jsonify({"msg": "没有上传文件"}), 400
 
     file = request.files["file"]
+    # 必填：学年 (如 2024)
+    academic_year = request.form.get("academic_year", type=int)
+    if not academic_year:
+        return jsonify({"msg": "请选择导入的学年"}), 400
+
     try:
-        # 1. 读取 Excel
-        df = pd.read_excel(file)
-        df = df.fillna("")
+        df = pd.read_excel(file).fillna("")
     except Exception as e:
         return jsonify({"msg": f"读取Excel失败: {str(e)}"}), 400
 
-    # 2. 预加载缓存 (保持原有逻辑)
+    # 预加载数据缓存
     all_subjects = Subject.query.all()
     subject_map = {s.name: s.id for s in all_subjects}
-    all_classes = ClassInfo.query.all()
-    class_map = {(c.entry_year, c.class_num): c.id for c in all_classes}
+
+    # 正则工具函数
+    def split_str(s):
+        return [x.strip() for x in re.split(r"[,，]", str(s)) if x.strip()]
+
+    def parse_year(yr_str):
+        match = re.search(r"(\d+)级?", str(yr_str))
+        if match:
+            y_str = match.group(1)
+            return int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
+        return None
 
     try:
-        # 导入前清空所有教师及相关账号信息
-        # 查询所有角色为 'teacher' 的用户
-        teachers_to_remove = User.query.filter_by(role="teacher").all()
+        # --- 步骤1：清理该学年的旧行政职务 (保留人员，只清空职务) ---
+        # 注意：这里不清空班主任(HeadTeacher)和任课(Course)，它们在另一个接口处理
+        db.session.query(GradeLeaderAssignment).filter_by(
+            academic_year=academic_year
+        ).delete()
+        db.session.query(SubjectGroupLeaderAssignment).filter_by(
+            academic_year=academic_year
+        ).delete()
+        db.session.query(PrepGroupLeaderAssignment).filter_by(
+            academic_year=academic_year
+        ).delete()
 
-        print(f"正在清理旧数据，共找到 {len(teachers_to_remove)} 个旧教师账号...")
+        # 统计变量
+        added_count = 0
+        updated_count = 0
 
-        for u in teachers_to_remove:
-            # 先删除关联的教师档案 (会级联删除 HeadTeacherAssignment, CourseAssignment 等)
-            if u.teacher_profile:
-                db.session.delete(u.teacher_profile)
-            # 再删除用户账号本身
-            db.session.delete(u)
-
-        # 立即刷新到数据库事务中，防止后面插入新数据时报 UniqueConstraint 错误（如用户名重复）
-        db.session.flush()
-        success_count = 0
-
-        # 3. 循环处理 Excel 行 (逻辑基本不变)
+        # --- 步骤2：遍历人员，更新基础信息 + 插入新职务 ---
         for index, row in df.iterrows():
             username = str(row.get("工号", "")).strip()
             name = str(row.get("姓名", "")).strip()
             if not username or not name:
                 continue
 
-            # --- 创建新用户 ---
-            # 因为前面已经清空了，这里直接创建即可
-            user = User(
-                username=username,
-                role="teacher",
-                is_approved=True,
-                must_change_password=True,
-            )
-            user.set_password("123456")
-            db.session.add(user)
-            db.session.flush()  # 获取 user.id
+            # A. 查找或创建用户 (增量更新核心逻辑)
+            user = User.query.filter_by(username=username).first()
+            if not user:
+                # 新增用户
+                user = User(
+                    username=username,
+                    role="teacher",
+                    is_approved=True,
+                    must_change_password=True,
+                )
+                user.set_password("123456")
+                db.session.add(user)
+                db.session.flush()  # 获取ID
 
-            # --- 创建教师档案 ---
-            teacher = Teacher(user_id=user.id, name=name)
-            # 填充基础信息
-            teacher.gender = str(row.get("性别", "男"))
-            teacher.phone = str(row.get("电话", ""))
-            teacher.job_title = str(row.get("职称", ""))
+                teacher = Teacher(user_id=user.id, name=name)
+                db.session.add(teacher)
+                db.session.flush()
+                added_count += 1
+            else:
+                # 更新老用户
+                teacher = user.teacher_profile
+                if teacher:
+                    teacher.name = name  # 更新姓名以防改名
+                    updated_count += 1
+                else:
+                    # 有账号没档案的异常情况修复
+                    teacher = Teacher(user_id=user.id, name=name)
+                    db.session.add(teacher)
+                    db.session.flush()
 
-            db.session.add(teacher)
-            db.session.flush()  # 获取 teacher.id
+            # B. 更新教师基础信息 (覆盖最新状态)
+            teacher.gender = str(row.get("性别", teacher.gender))
+            teacher.phone = str(row.get("电话", teacher.phone))
+            teacher.job_title = str(row.get("职称", teacher.job_title))
+            teacher.status = str(row.get("状态", teacher.status))  # 读取Excel中的状态列
 
-            # --- 复杂职务解析 (使用修复后的正则) ---
-            def split_str(s):
-                return [x.strip() for x in re.split(r"[,，]", str(s)) if x.strip()]
+            # C. 插入行政职务 (带上 academic_year)
 
-            # 修复后的正则：兼容括号中间的非数字字符
-            def parse_class_id(cls_str):
-                match = re.search(r"(\d+)级\D*?(\d+)\D*?班", cls_str)
-                if match:
-                    y_str = match.group(1)
-                    c_num = int(match.group(2))
-                    entry_year = int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
-                    return class_map.get((entry_year, c_num))
-                return None
-
-            def parse_year(yr_str):
-                match = re.search(r"(\d+)级?", yr_str)
-                if match:
-                    y_str = match.group(1)
-                    return int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
-                return None
-
-            # A. 班主任
-            ht_str = row.get("班主任分配", "")
-            for item in split_str(ht_str):
-                cid = parse_class_id(item)
-                if cid:
-                    db.session.add(
-                        HeadTeacherAssignment(teacher_id=teacher.id, class_id=cid)
-                    )
-
-            # B. 级长
+            # 1. 级长
             gl_str = row.get("级长分配", "")
             for item in split_str(gl_str):
-                year = parse_year(item)
-                if year:
+                entry_year = parse_year(item)
+                if entry_year:
                     db.session.add(
-                        GradeLeaderAssignment(teacher_id=teacher.id, entry_year=year)
+                        GradeLeaderAssignment(
+                            teacher_id=teacher.id,
+                            entry_year=entry_year,
+                            academic_year=academic_year,  # 关键字段
+                        )
                     )
 
-            # C. 科组长
+            # 2. 科组长
             sgl_str = row.get("科组长分配", "")
             for item in split_str(sgl_str):
                 sid = subject_map.get(item)
                 if sid:
                     db.session.add(
                         SubjectGroupLeaderAssignment(
-                            teacher_id=teacher.id, subject_id=sid
+                            teacher_id=teacher.id,
+                            subject_id=sid,
+                            academic_year=academic_year,
                         )
                     )
 
-            # D. 备课组长
+            # 3. 备课组长
             pgl_str = row.get("备课组长分配", "")
             for item in split_str(pgl_str):
-                year_match = re.match(r"(\d+)级?", item)
-                if year_match:
-                    y_str = year_match.group(1)
+                # 解析 "2023级语文"
+                y_match = re.search(r"(\d+)级?", item)
+                if y_match:
+                    y_str = y_match.group(1)
                     entry_year = int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
                     sub_name = item.replace(y_str, "").replace("级", "").strip()
                     sid = subject_map.get(sub_name)
@@ -979,37 +1037,23 @@ def import_teachers_excel():
                                 teacher_id=teacher.id,
                                 entry_year=entry_year,
                                 subject_id=sid,
+                                academic_year=academic_year,
                             )
                         )
 
-            # E. 任教分配
-            teach_str = row.get("任教分配", "")
-            for item in split_str(teach_str):
-                parts = re.split(r"[-_]", item)
-                if len(parts) >= 2:
-                    cls_part = parts[0].strip()
-                    sub_part = parts[1].strip()
-                    cid = parse_class_id(cls_part)
-                    sid = subject_map.get(sub_part)
-                    if cid and sid:
-                        db.session.add(
-                            CourseAssignment(
-                                teacher_id=teacher.id, class_id=cid, subject_id=sid
-                            )
-                        )
-
-            success_count += 1
-
-        # 提交事务：清理和新增同时生效
         db.session.commit()
-        return jsonify({"msg": f"系统已重置，并成功导入 {success_count} 位教师信息"})
+        return jsonify(
+            {
+                "msg": f"处理完成。新增教师 {added_count} 人，更新 {updated_count} 人。行政职务已更新至 {academic_year} 学年。"
+            }
+        )
 
     except Exception as e:
-        db.session.rollback()  # 出错则回滚，旧数据和新数据都不会变
+        db.session.rollback()
         import traceback
 
         traceback.print_exc()
-        return jsonify({"msg": f"处理数据时出错: {str(e)}"}), 500
+        return jsonify({"msg": f"导入失败: {str(e)}"}), 500
 
 
 # --- 考试发布管理 ---
@@ -1118,136 +1162,133 @@ def import_course_assignments():
         return jsonify({"msg": "没有上传文件"}), 400
 
     file = request.files["file"]
-    if file.filename == "":
-        return jsonify({"msg": "文件名为空"}), 400
+    academic_year = request.form.get("academic_year", type=int)
+    if not academic_year:
+        return jsonify({"msg": "请选择导入的学年"}), 400
 
     try:
-        df = pd.read_excel(file)
-        df = df.fillna("")  # 填充空值
+        df = pd.read_excel(file).fillna("")
     except Exception as e:
         return jsonify({"msg": f"Excel读取失败: {str(e)}"}), 400
 
-    # 1. 预加载数据库数据 (构建映射字典以减少查询)
-    # 教师映射: { "张三": teacher_obj_id }
+    # 1. 预加载映射
     all_teachers = Teacher.query.all()
     teacher_map = {t.name: t.id for t in all_teachers}
 
-    # 科目映射: { "语文": subject_id }
     all_subjects = Subject.query.all()
     subject_map = {s.name: s.id for s in all_subjects}
 
-    # 班级映射: 这里我们需要处理 "21级(01)班" 这种格式
-    # 构建一个临时 key: f"{short_year}级({class_num_str})班" -> class_id
+    # 班级映射
     all_classes = ClassInfo.query.all()
     class_map = {}
     for c in all_classes:
-        # 假设 entry_year 是 2021，截取后两位 "21"
         short_year = str(c.entry_year)[-2:]
-        class_num_str = str(c.class_num).zfill(2)  # 补零，变成 "01"
+        class_num_str = str(c.class_num).zfill(2)
         key = f"{short_year}级({class_num_str})班"
         class_map[key] = c.id
 
-    # 2. 核心校验：检查 Excel 中所有非空的教师姓名是否存在
+    # 2. 校验 (保持不变)
     missing_teachers = set()
     errors = []
 
-    # 遍历 Excel 每一行
     for index, row in df.iterrows():
         row_num = index + 2
-
-        # 获取班级
         class_name = str(row.get("班级名称", "")).strip()
         if not class_name:
-            continue  # 跳过空行
-
-        if class_name not in class_map:
-            errors.append(
-                f"第 {row_num} 行：找不到班级 [{class_name}]，请检查格式是否为 xx级(xx)班"
-            )
             continue
 
-        # 遍历该行的每一列 (排除 班级名称、人数 等非教师列)
+        if class_name not in class_map:
+            errors.append(f"第 {row_num} 行：找不到班级 [{class_name}]")
+            continue
+
         for col_name in df.columns:
             cell_value = str(row[col_name]).strip()
             if not cell_value:
-                continue  # 空单元格跳过（符合“特定年级无该学科则留空”的规则）
+                continue
 
-            # 判断列名是否涉及教师分配
-            is_subject = col_name in subject_map
-            is_head_teacher = col_name == "班主任"
-
-            if is_subject or is_head_teacher:
-                # 校验教师是否存在
+            if col_name == "班主任" or col_name in subject_map:
                 if cell_value not in teacher_map:
                     missing_teachers.add(cell_value)
-                    errors.append(
-                        f"第 {row_num} 行 [{col_name}]：教师 [{cell_value}] 在系统中不存在"
-                    )
 
-    # 3. 如果发现校验错误，立即中断并返回
     if missing_teachers or errors:
-        msg = "导入失败，发现未知教师或数据错误。"
+        msg = "导入校验未通过。"
         if missing_teachers:
-            msg += f" 以下教师未在系统中录入: {', '.join(missing_teachers)}。"
-        return jsonify({"msg": msg, "errors": errors}), 400
+            msg += f" 未知教师: {', '.join(missing_teachers)}。"
+        if errors:
+            msg += f" 格式错误: {'; '.join(errors[:5])}..."
+        return jsonify({"msg": msg}), 400
 
-    # 4. 数据写入 (校验通过后，执行写入)
-    success_count = 0
+    # 3. 执行导入 (修复了这里的逻辑错误)
     try:
+        # A. 清空该学年的旧数据
+        db.session.query(CourseAssignment).filter_by(
+            academic_year=academic_year
+        ).delete()
+        db.session.query(HeadTeacherAssignment).filter_by(
+            academic_year=academic_year
+        ).delete()
+
+        count = 0
+
         for index, row in df.iterrows():
             class_name = str(row.get("班级名称", "")).strip()
             if not class_name or class_name not in class_map:
                 continue
-
             class_id = class_map[class_name]
 
-            # 遍历列
+            # B. 遍历列
             for col_name in df.columns:
                 teacher_name = str(row[col_name]).strip()
                 if not teacher_name:
                     continue
 
-                teacher_id = teacher_map.get(teacher_name)
+                # --- [修复核心] 先判断列名，再查找 ID ---
 
-                # A. 处理班主任分配
+                # 插入班主任
                 if col_name == "班主任":
-                    # 先查询该班级是否已有班主任
-                    ht_assign = HeadTeacherAssignment.query.filter_by(
-                        class_id=class_id
-                    ).first()
-                    if ht_assign:
-                        ht_assign.teacher_id = teacher_id  # 更新
-                    else:
-                        new_ht = HeadTeacherAssignment(
-                            teacher_id=teacher_id, class_id=class_id
+                    # 只有确认是班主任列，才去查老师ID
+                    teacher_id = teacher_map.get(teacher_name)
+                    if teacher_id:
+                        db.session.add(
+                            HeadTeacherAssignment(
+                                teacher_id=teacher_id,
+                                class_id=class_id,
+                                academic_year=academic_year,
+                            )
                         )
-                        db.session.add(new_ht)
 
-                # B. 处理学科任教分配
+                # 插入任课
                 elif col_name in subject_map:
+                    # 只有确认是科目列，才去查老师ID
+                    teacher_id = teacher_map.get(teacher_name)
                     subject_id = subject_map[col_name]
-                    # 查询该班级+该科目是否已有分配
-                    course_assign = CourseAssignment.query.filter_by(
-                        class_id=class_id, subject_id=subject_id
-                    ).first()
-
-                    if course_assign:
-                        course_assign.teacher_id = teacher_id  # 更新任课老师
-                    else:
-                        new_ca = CourseAssignment(
-                            class_id=class_id,
-                            subject_id=subject_id,
-                            teacher_id=teacher_id,
+                    if teacher_id:
+                        db.session.add(
+                            CourseAssignment(
+                                teacher_id=teacher_id,
+                                class_id=class_id,
+                                subject_id=subject_id,
+                                academic_year=academic_year,
+                            )
                         )
-                        db.session.add(new_ca)
 
-            success_count += 1
+                # 其他列（如“班级名称”、“人数”）直接跳过，不会触发 KeyError
+
+            count += 1
 
         db.session.commit()
-        return jsonify({"msg": f"导入成功，已更新 {success_count} 个班级的任课信息"})
+        return jsonify(
+            {
+                "msg": f"导入成功！已更新 {academic_year} 学年 {count} 个班级的任课与班主任信息。"
+            }
+        )
 
     except Exception as e:
         db.session.rollback()
+        # 打印详细错误到后台控制台以便调试
+        import traceback
+
+        traceback.print_exc()
         return jsonify({"msg": f"数据库写入错误: {str(e)}"}), 500
 
 
