@@ -57,7 +57,7 @@ class Teacher(db.Model):
     )
 
 
-# 3. 班级表 (不变)
+# 3. 班级表 (修改 grade_display)
 class ClassInfo(db.Model):
     __tablename__ = "classes"
     id = db.Column(db.Integer, primary_key=True)
@@ -67,16 +67,8 @@ class ClassInfo(db.Model):
 
     @property
     def grade_display(self):
-        # 注意：这个属性是动态计算的，只代表“当前”的年级。
-        # 如果要查询历史某个学年时的年级，需要在业务逻辑中手动计算 (查询学年 - entry_year)
-        current_year = datetime.now().year
-        if datetime.now().month >= 9:
-            diff = current_year - self.entry_year
-        else:
-            diff = current_year - self.entry_year - 1
-
-        grade_map = {0: "初一", 1: "初二", 2: "初三"}
-        return grade_map.get(diff, "已毕业")
+        # 修改：统一显示为 xx级，不再计算初一/初二/初三
+        return f"{self.entry_year}级"
 
     @property
     def full_name(self):
@@ -90,14 +82,14 @@ class Subject(db.Model):
     name = db.Column(db.String(20), unique=True, nullable=False)
 
 
-# 5. 考试任务表 (新增 academic_year)
+# 5. 考试任务表 (修改 grade_name)
 class ExamTask(db.Model):
     __tablename__ = "exam_tasks"
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(50), nullable=False)
     entry_year = db.Column(db.Integer, nullable=False)  # 针对哪个年级 (如2023级)
 
-    # [新增] 所属学年 (如 2024 表示 2024-2025学年)
+    # 所属学年 (如 2024 表示 2024-2025学年)
     academic_year = db.Column(db.Integer, nullable=False, default=datetime.now().year)
 
     subject_id = db.Column(db.Integer, db.ForeignKey("subjects.id"), nullable=False)
@@ -109,14 +101,8 @@ class ExamTask(db.Model):
 
     @property
     def grade_name(self):
-        # 同样，这个是基于当前时间的动态显示。历史查询时建议后端计算好返回给前端。
-        current_year = datetime.now().year
-        if datetime.now().month >= 9:
-            diff = current_year - self.entry_year
-        else:
-            diff = current_year - self.entry_year - 1
-        grade_map = {0: "初一", 1: "初二", 2: "初三"}
-        return grade_map.get(diff, f"{self.entry_year}级")
+        # 修改：统一显示为 xx级
+        return f"{self.entry_year}级"
 
 
 # --- 职务分配关联表 (全部新增 academic_year) ---
@@ -128,7 +114,7 @@ class HeadTeacherAssignment(db.Model):
     teacher_id = db.Column(db.Integer, db.ForeignKey("teachers.id"))
     class_id = db.Column(db.Integer, db.ForeignKey("classes.id"))
 
-    # [新增] 学年
+    # 学年
     academic_year = db.Column(db.Integer, nullable=False)
 
     class_info = db.relationship("ClassInfo")
@@ -145,7 +131,7 @@ class GradeLeaderAssignment(db.Model):
     teacher_id = db.Column(db.Integer, db.ForeignKey("teachers.id"))
     entry_year = db.Column(db.Integer)  # 负责哪一届
 
-    # [新增] 学年
+    # 学年
     academic_year = db.Column(db.Integer, nullable=False)
 
     @property
@@ -159,7 +145,7 @@ class SubjectGroupLeaderAssignment(db.Model):
     teacher_id = db.Column(db.Integer, db.ForeignKey("teachers.id"))
     subject_id = db.Column(db.Integer, db.ForeignKey("subjects.id"))
 
-    # [新增] 学年
+    # 学年
     academic_year = db.Column(db.Integer, nullable=False)
 
     subject = db.relationship("Subject")
@@ -172,7 +158,7 @@ class PrepGroupLeaderAssignment(db.Model):
     entry_year = db.Column(db.Integer)
     subject_id = db.Column(db.Integer, db.ForeignKey("subjects.id"))
 
-    # [新增] 学年
+    # 学年
     academic_year = db.Column(db.Integer, nullable=False)
 
     subject = db.relationship("Subject")
@@ -189,7 +175,7 @@ class CourseAssignment(db.Model):
     class_id = db.Column(db.Integer, db.ForeignKey("classes.id"))
     subject_id = db.Column(db.Integer, db.ForeignKey("subjects.id"))
 
-    # [新增] 学年
+    # 学年
     academic_year = db.Column(db.Integer, nullable=False)
 
     class_info = db.relationship("ClassInfo")
@@ -235,7 +221,7 @@ class Score(db.Model):
     exam_task_id = db.Column(db.Integer, db.ForeignKey("exam_tasks.id"), nullable=True)
     task = db.relationship("ExamTask")
 
-    # [新增] 班级快照：记录考试时学生所在的班级ID，防止学生转班后历史成绩归属错误
+    # 班级快照：记录考试时学生所在的班级ID，防止学生转班后历史成绩归属错误
     class_id_snapshot = db.Column(
         db.Integer, db.ForeignKey("classes.id"), nullable=True
     )

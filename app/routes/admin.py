@@ -908,7 +908,7 @@ def import_teachers_excel():
         return jsonify({"msg": "没有上传文件"}), 400
 
     file = request.files["file"]
-    # 必填：学年 (如 2024)
+    # 必填：学年 (如 2025)
     academic_year = request.form.get("academic_year", type=int)
     if not academic_year:
         return jsonify({"msg": "请选择导入的学年"}), 400
@@ -917,6 +917,11 @@ def import_teachers_excel():
         df = pd.read_excel(file).fillna("")
     except Exception as e:
         return jsonify({"msg": f"读取Excel失败: {str(e)}"}), 400
+
+    # --- 定义合法年级范围 (初一至初三) ---
+    # 例如 2025学年，合法年级为 [2025, 2024, 2023]
+    valid_years = [academic_year, academic_year - 1, academic_year - 2]
+    valid_years_str = "/".join([f"{y}级" for y in valid_years])
 
     # 预加载数据缓存
     all_subjects = Subject.query.all()
@@ -927,15 +932,65 @@ def import_teachers_excel():
         return [x.strip() for x in re.split(r"[,，]", str(s)) if x.strip()]
 
     def parse_year(yr_str):
+        # 提取 "23级" 或 "2023级" 中的数字
         match = re.search(r"(\d+)级?", str(yr_str))
         if match:
             y_str = match.group(1)
+            # 自动补全：23 -> 2023
             return int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
         return None
 
+    # --- 阶段一：严格数据校验 (不操作数据库) ---
+    errors = []
+
+    for index, row in df.iterrows():
+        row_num = index + 2
+        name = str(row.get("姓名", "")).strip()
+        if not name:
+            continue
+
+        # 1. 校验级长分配
+        gl_str = row.get("级长分配", "")
+        for item in split_str(gl_str):
+            entry_year = parse_year(item)
+            if entry_year and entry_year not in valid_years:
+                errors.append(
+                    f"行{row_num} ({name}): 级长年份【{entry_year}级】在 {academic_year} 学年无效。合法范围: {valid_years_str}"
+                )
+
+        # 2. 校验备课组长分配 (格式如 "23级语文")
+        pgl_str = row.get("备课组长分配", "")
+        for item in split_str(pgl_str):
+            # 解析年份
+            y_match = re.search(r"(\d+)级?", item)
+            if y_match:
+                y_str = y_match.group(1)
+                entry_year = int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
+
+                if entry_year not in valid_years:
+                    errors.append(
+                        f"行{row_num} ({name}): 备课组年份【{entry_year}级】在 {academic_year} 学年无效。合法范围: {valid_years_str}"
+                    )
+
+            # 顺便校验科目是否存在
+            sub_name = re.sub(r"\d+级?", "", item).strip()
+            if sub_name and sub_name not in subject_map:
+                errors.append(f"行{row_num} ({name}): 备课组科目【{sub_name}】不存在")
+
+    # 如果有任何错误，直接返回，不进行数据库操作
+    if errors:
+        # 只展示前 5 条错误，避免弹窗太长
+        error_msg = "<br>".join(errors[:5])
+        if len(errors) > 5:
+            error_msg += f"<br>... 等共 {len(errors)} 处错误"
+        return (
+            jsonify({"msg": f"数据校验未通过，请修正Excel后重试：<br>{error_msg}"}),
+            400,
+        )
+
+    # --- 阶段二：校验通过，执行写入 ---
     try:
-        # --- 步骤1：清理该学年的旧行政职务 (保留人员，只清空职务) ---
-        # 注意：这里不清空班主任(HeadTeacher)和任课(Course)，它们在另一个接口处理
+        # 1. 清理该学年的旧行政职务
         db.session.query(GradeLeaderAssignment).filter_by(
             academic_year=academic_year
         ).delete()
@@ -946,21 +1001,19 @@ def import_teachers_excel():
             academic_year=academic_year
         ).delete()
 
-        # 统计变量
         added_count = 0
         updated_count = 0
 
-        # --- 步骤2：遍历人员，更新基础信息 + 插入新职务 ---
+        # 2. 遍历并写入
         for index, row in df.iterrows():
             username = str(row.get("工号", "")).strip()
             name = str(row.get("姓名", "")).strip()
             if not username or not name:
                 continue
 
-            # A. 查找或创建用户 (增量更新核心逻辑)
+            # A. 查找或创建用户
             user = User.query.filter_by(username=username).first()
             if not user:
-                # 新增用户
                 user = User(
                     username=username,
                     role="teacher",
@@ -969,33 +1022,31 @@ def import_teachers_excel():
                 )
                 user.set_password("123456")
                 db.session.add(user)
-                db.session.flush()  # 获取ID
+                db.session.flush()
 
                 teacher = Teacher(user_id=user.id, name=name)
                 db.session.add(teacher)
                 db.session.flush()
                 added_count += 1
             else:
-                # 更新老用户
                 teacher = user.teacher_profile
                 if teacher:
-                    teacher.name = name  # 更新姓名以防改名
+                    teacher.name = name
                     updated_count += 1
                 else:
-                    # 有账号没档案的异常情况修复
                     teacher = Teacher(user_id=user.id, name=name)
                     db.session.add(teacher)
                     db.session.flush()
 
-            # B. 更新教师基础信息 (覆盖最新状态)
+            # B. 更新基础信息
             teacher.gender = str(row.get("性别", teacher.gender))
             teacher.phone = str(row.get("电话", teacher.phone))
             teacher.job_title = str(row.get("职称", teacher.job_title))
-            teacher.status = str(row.get("状态", teacher.status))  # 读取Excel中的状态列
+            teacher.status = str(row.get("状态", teacher.status))
 
-            # C. 插入行政职务 (带上 academic_year)
+            # C. 插入行政职务 (此时数据已安全)
 
-            # 1. 级长
+            # 级长
             gl_str = row.get("级长分配", "")
             for item in split_str(gl_str):
                 entry_year = parse_year(item)
@@ -1004,11 +1055,11 @@ def import_teachers_excel():
                         GradeLeaderAssignment(
                             teacher_id=teacher.id,
                             entry_year=entry_year,
-                            academic_year=academic_year,  # 关键字段
+                            academic_year=academic_year,
                         )
                     )
 
-            # 2. 科组长
+            # 科组长
             sgl_str = row.get("科组长分配", "")
             for item in split_str(sgl_str):
                 sid = subject_map.get(item)
@@ -1021,16 +1072,18 @@ def import_teachers_excel():
                         )
                     )
 
-            # 3. 备课组长
+            # 备课组长
             pgl_str = row.get("备课组长分配", "")
             for item in split_str(pgl_str):
-                # 解析 "2023级语文"
                 y_match = re.search(r"(\d+)级?", item)
                 if y_match:
                     y_str = y_match.group(1)
                     entry_year = int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
-                    sub_name = item.replace(y_str, "").replace("级", "").strip()
+                    sub_name = item.replace(
+                        y_match.group(0), ""
+                    ).strip()  # 去掉年份即为科目
                     sid = subject_map.get(sub_name)
+
                     if entry_year and sid:
                         db.session.add(
                             PrepGroupLeaderAssignment(
@@ -1062,12 +1115,16 @@ def get_exam_tasks():
     # 支持筛选
     entry_year = request.args.get("entry_year", type=int)
     subject_id = request.args.get("subject_id", type=int)
+    # [新增] 支持按学年筛选
+    academic_year = request.args.get("academic_year", type=int)
 
     query = ExamTask.query
     if entry_year:
         query = query.filter_by(entry_year=entry_year)
     if subject_id:
         query = query.filter_by(subject_id=subject_id)
+    if academic_year:
+        query = query.filter_by(academic_year=academic_year)
 
     tasks = query.order_by(ExamTask.create_time.desc()).all()
 
@@ -1077,11 +1134,12 @@ def get_exam_tasks():
                 "id": t.id,
                 "name": t.name,
                 "entry_year": t.entry_year,
-                "grade_name": t.grade_name,  # 动态计算的年级名 (如初一)
+                "grade_name": t.grade_name,
                 "subject_id": t.subject_id,
                 "subject_name": t.subject.name if t.subject else "-",
                 "full_score": t.full_score,
                 "is_active": t.is_active,
+                "academic_year": t.academic_year,  # [新增] 返回学年信息
             }
             for t in tasks
         ]
@@ -1091,18 +1149,26 @@ def get_exam_tasks():
 @admin_bp.route("/exam_tasks", methods=["POST"])
 def add_exam_task():
     data = request.get_json()
-    # 简单的防重复：同年级、同科目、同名
+
+    # 简单的防重复：同学年、同年级、同科目、同名
+    # [修改] 增加 academic_year 的校验维度
+    academic_year = data.get("academic_year", datetime.now().year)
+
     exists = ExamTask.query.filter_by(
-        entry_year=data["entry_year"], subject_id=data["subject_id"], name=data["name"]
+        academic_year=academic_year,
+        entry_year=data["entry_year"],
+        subject_id=data["subject_id"],
+        name=data["name"],
     ).first()
 
     if exists:
-        return jsonify({"msg": "该考试任务已存在"}), 400
+        return jsonify({"msg": "该学年的此考试任务已存在"}), 400
 
     new_task = ExamTask(
         name=data["name"],
         entry_year=data["entry_year"],
         subject_id=data["subject_id"],
+        academic_year=academic_year,  # [新增] 保存学年
         full_score=data.get("full_score", 100),
         is_active=data.get("is_active", True),
     )
@@ -1171,6 +1237,11 @@ def import_course_assignments():
     except Exception as e:
         return jsonify({"msg": f"Excel读取失败: {str(e)}"}), 400
 
+    # --- 定义合法年级范围 (初一至初三) ---
+    # 例如 2025学年，合法班级为 2025级、2024级、2023级
+    valid_years = [academic_year, academic_year - 1, academic_year - 2]
+    valid_years_str = "/".join([f"{y}级" for y in valid_years])
+
     # 1. 预加载映射
     all_teachers = Teacher.query.all()
     teacher_map = {t.name: t.id for t in all_teachers}
@@ -1178,7 +1249,7 @@ def import_course_assignments():
     all_subjects = Subject.query.all()
     subject_map = {s.name: s.id for s in all_subjects}
 
-    # 班级映射
+    # 班级映射 (用于后续写入)
     all_classes = ClassInfo.query.all()
     class_map = {}
     for c in all_classes:
@@ -1187,38 +1258,82 @@ def import_course_assignments():
         key = f"{short_year}级({class_num_str})班"
         class_map[key] = c.id
 
-    # 2. 校验 (保持不变)
-    missing_teachers = set()
+    # 正则用于解析 "23级(01)班"
+    class_pattern = re.compile(r"(\d+)级\((\d+)\)班")
+
+    # --- 阶段一：严格数据校验 (不操作数据库) ---
     errors = []
+    missing_teachers = set()
 
     for index, row in df.iterrows():
         row_num = index + 2
         class_name = str(row.get("班级名称", "")).strip()
+
         if not class_name:
             continue
 
+        # A. 校验班级是否存在于系统
         if class_name not in class_map:
-            errors.append(f"第 {row_num} 行：找不到班级 [{class_name}]")
+            # 尝试解析一下看是不是年份不对
+            match = class_pattern.match(class_name)
+            if match:
+                y_str = match.group(1)
+                # 补全年份 23 -> 2023
+                entry_year = int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
+
+                # 核心校验：检查年份是否合法
+                if entry_year not in valid_years:
+                    errors.append(
+                        f"行{row_num}: 班级【{class_name}】的年份在 {academic_year} 学年无效。合法范围: {valid_years_str}"
+                    )
+                else:
+                    # 年份合法但系统没这班，提示去创建
+                    errors.append(
+                        f"行{row_num}: 系统中找不到班级【{class_name}】，请先在班级管理中创建"
+                    )
+            else:
+                errors.append(
+                    f"行{row_num}: 班级名格式错误【{class_name}】，应为如 '23级(01)班'"
+                )
             continue
 
+        # B. 如果班级存在，也要反向检查它的年份是否符合当前学年逻辑
+        # (防止用户把 2021级的班强行导入到 2025学年)
+        cls_obj = ClassInfo.query.get(class_map[class_name])
+        if cls_obj and cls_obj.entry_year not in valid_years:
+            errors.append(
+                f"行{row_num}: 班级【{class_name}】是 {cls_obj.entry_year}级，不属于 {academic_year} 学年的初中范围 ({valid_years_str})"
+            )
+
+        # C. 校验老师是否存在
         for col_name in df.columns:
             cell_value = str(row[col_name]).strip()
             if not cell_value:
                 continue
 
             if col_name == "班主任" or col_name in subject_map:
+                # 支持多个老师用逗号分隔的情况吗？目前代码逻辑看似是单个
+                # 这里假设 Excel 里填的是单个老师姓名
                 if cell_value not in teacher_map:
                     missing_teachers.add(cell_value)
 
-    if missing_teachers or errors:
-        msg = "导入校验未通过。"
-        if missing_teachers:
-            msg += f" 未知教师: {', '.join(missing_teachers)}。"
-        if errors:
-            msg += f" 格式错误: {'; '.join(errors[:5])}..."
-        return jsonify({"msg": msg}), 400
+    # 汇总错误
+    if missing_teachers:
+        # 只显示前5个
+        t_list = list(missing_teachers)[:5]
+        msg = f"系统不存在以下教师: {', '.join(t_list)}"
+        if len(missing_teachers) > 5:
+            msg += "..."
+        errors.append(msg)
 
-    # 3. 执行导入 (修复了这里的逻辑错误)
+    if errors:
+        # 格式化错误信息返回
+        error_html = "<br>".join(errors[:8])
+        if len(errors) > 8:
+            error_html += f"<br>... 等共 {len(errors)} 处问题"
+        return jsonify({"msg": f"校验失败，请修正后重试：<br>{error_html}"}), 400
+
+    # --- 阶段二：校验通过，执行写入 ---
     try:
         # A. 清空该学年的旧数据
         db.session.query(CourseAssignment).filter_by(
@@ -1242,11 +1357,8 @@ def import_course_assignments():
                 if not teacher_name:
                     continue
 
-                # --- [修复核心] 先判断列名，再查找 ID ---
-
                 # 插入班主任
                 if col_name == "班主任":
-                    # 只有确认是班主任列，才去查老师ID
                     teacher_id = teacher_map.get(teacher_name)
                     if teacher_id:
                         db.session.add(
@@ -1259,7 +1371,6 @@ def import_course_assignments():
 
                 # 插入任课
                 elif col_name in subject_map:
-                    # 只有确认是科目列，才去查老师ID
                     teacher_id = teacher_map.get(teacher_name)
                     subject_id = subject_map[col_name]
                     if teacher_id:
@@ -1272,8 +1383,6 @@ def import_course_assignments():
                             )
                         )
 
-                # 其他列（如“班级名称”、“人数”）直接跳过，不会触发 KeyError
-
             count += 1
 
         db.session.commit()
@@ -1285,7 +1394,6 @@ def import_course_assignments():
 
     except Exception as e:
         db.session.rollback()
-        # 打印详细错误到后台控制台以便调试
         import traceback
 
         traceback.print_exc()

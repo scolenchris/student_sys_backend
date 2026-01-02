@@ -21,12 +21,14 @@ def get_my_courses(user_id):
     # 找到该用户的教师档案
     teacher = Teacher.query.filter_by(user_id=user_id).first()
     if not teacher:
-        return jsonify([]), 200  # 如果没找到教师档案，返回空列表
+        return jsonify([]), 200
 
     # 查询关联的班级和科目
+    # 修改点：额外查询 academic_year，用于后续匹配考试任务
     assignments = (
         db.session.query(
             CourseAssignment.id,
+            CourseAssignment.academic_year,
             ClassInfo.id.label("class_id"),
             ClassInfo.entry_year,
             ClassInfo.class_num,
@@ -39,18 +41,34 @@ def get_my_courses(user_id):
         .all()
     )
 
-    return jsonify(
-        [
-            {
-                "assignment_id": a.id,
-                "class_id": a.class_id,
-                "grade_class": f"{a.entry_year}级({a.class_num})班",
-                "subject_name": a.subject_name,
-                "subject_id": a.subject_id,
-            }
-            for a in assignments
-        ]
-    )
+    valid_courses = []
+
+    for a in assignments:
+        # 核心过滤：检查该班级（年级+学年）在当前科目下，是否有“未锁定”的考试
+        # 只有存在 is_active=True 的考试，才把这个班级返回给前端
+        has_active_exam = (
+            db.session.query(ExamTask.id)
+            .filter_by(
+                entry_year=a.entry_year,  # 匹配年级 (如2023级)
+                subject_id=a.subject_id,  # 匹配科目
+                academic_year=a.academic_year,  # 匹配学年 (如2025学年)
+                is_active=True,  # 必须是开启状态
+            )
+            .first()
+        )
+
+        if has_active_exam:
+            valid_courses.append(
+                {
+                    "assignment_id": a.id,
+                    "class_id": a.class_id,
+                    "grade_class": f"{a.entry_year}级({a.class_num})班",
+                    "subject_name": a.subject_name,
+                    "subject_id": a.subject_id,
+                }
+            )
+
+    return jsonify(valid_courses)
 
 
 # --- 2. 获取打分列表（学生名单 + 现有分数） ---
@@ -167,7 +185,9 @@ def get_available_exams():
     # 2. 查询该年级、该科目下所有已发布的考试
     # 教师端通常只关心 is_active=True 的，或者全部显示但锁住禁录的
     tasks = (
-        ExamTask.query.filter_by(entry_year=cls.entry_year, subject_id=subject_id)
+        ExamTask.query.filter_by(
+            entry_year=cls.entry_year, subject_id=subject_id, is_active=True
+        )
         .order_by(ExamTask.create_time.desc())
         .all()
     )
