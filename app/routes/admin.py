@@ -2019,3 +2019,414 @@ def get_teacher_score_stats():
             final_result.append(total_row)
 
     return jsonify(final_result)
+
+
+@admin_bp.route("/stats/score_template", methods=["POST"])
+def get_score_import_template():
+    """
+    功能A & B: 动态模版下载 / 备份导出
+    接收: entry_year(必填), class_ids(列表), subject_ids(列表), exam_name(选填, 若填则为备份模式)
+    """
+    data = request.get_json()
+    entry_year = data.get("entry_year")
+    class_ids = data.get("class_ids", [])
+    subject_ids = data.get("subject_ids", [])
+    exam_name = data.get("exam_name")  # 如果有值，则是备份导出；为空则是空模版
+
+    if not entry_year or not subject_ids:
+        return jsonify({"msg": "请至少选择年级和统计科目"}), 400
+
+    # 1. 获取科目名称 (作为动态表头)
+    subjects = (
+        Subject.query.filter(Subject.id.in_(subject_ids)).order_by(Subject.id).all()
+    )
+    subject_names = [s.name for s in subjects]
+
+    # 2. 获取班级 (若前端未选班级，默认全级)
+    query_cls = ClassInfo.query.filter_by(entry_year=entry_year)
+    if class_ids:
+        query_cls = query_cls.filter(ClassInfo.id.in_(class_ids))
+    classes = query_cls.order_by(ClassInfo.class_num).all()
+    target_class_ids = [c.id for c in classes]
+
+    # 3. 获取学生
+    students = (
+        Student.query.filter(
+            Student.class_id.in_(target_class_ids), Student.status == "在读"
+        )
+        .order_by(Student.class_id, Student.student_id)
+        .all()
+    )
+
+    # 4. 如果是备份模式，预取成绩
+    score_map = {}  # {(student_id, subject_name): score_val}
+    if exam_name:
+        # 找到对应的考试任务IDs
+        tasks = ExamTask.query.filter(
+            ExamTask.entry_year == entry_year,
+            ExamTask.name == exam_name,
+            ExamTask.subject_id.in_(subject_ids),
+        ).all()
+        task_ids = [t.id for t in tasks]
+        task_subj_map = {t.id: t.subject.name for t in tasks}  # task_id -> subject_name
+
+        scores = Score.query.filter(
+            Score.exam_task_id.in_(task_ids),
+            Score.student_id.in_([s.id for s in students]),
+        ).all()
+
+        for sc in scores:
+            s_name = task_subj_map.get(sc.exam_task_id)
+            val = "缺考" if sc.remark == "缺考" else sc.score
+            score_map[(sc.student_id, s_name)] = val
+
+    # 5. 构建 DataFrame
+    data_list = []
+    for s in students:
+        # 格式化班级名
+        c = s.current_class_rel
+        class_name_str = f"{str(c.entry_year)[-2:]}级({str(c.class_num).zfill(2)})班"
+
+        row = {"学号": s.student_id, "姓名": s.name, "班级名称": class_name_str}
+
+        # 填充科目列
+        for sub_name in subject_names:
+            if exam_name:
+                # 备份模式：填入成绩
+                row[sub_name] = score_map.get((s.id, sub_name), "")
+            else:
+                # 模版模式：留空
+                row[sub_name] = ""
+
+        data_list.append(row)
+
+    df = pd.DataFrame(data_list)
+
+    # 确保列顺序
+    cols = ["学号", "姓名", "班级名称"] + subject_names
+    df = df.reindex(columns=cols)
+
+    # 6. 导出
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        sheet_name = "成绩备份" if exam_name else "录入模版"
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    output.seek(0)
+
+    filename = f"{entry_year}级_{exam_name or '导入模版'}_成绩数据.xlsx"
+    from urllib.parse import quote
+
+    filename = quote(filename)
+
+    return send_file(
+        output,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=filename,
+        max_age=0,
+    )
+
+
+@admin_bp.route("/stats/import_scores", methods=["POST"])
+def import_admin_scores():
+    """
+    功能C: 严格模式导入 (原子性事务)
+    Step 1: 检查考试任务发布
+    Step 2: 严格表头校验
+    Step 3: 白名单过滤 (记录警告)
+    Step 4: 身份三维匹配 (记录致命错误)
+    Step 5: 写入或回滚
+    """
+    if "file" not in request.files:
+        return jsonify({"msg": "未上传文件"}), 400
+
+    file = request.files["file"]
+    entry_year = request.form.get("entry_year", type=int)
+    exam_name = request.form.get("exam_name")
+
+    # 接收 JSON 字符串并解析
+    import json
+
+    try:
+        subject_ids = json.loads(request.form.get("subject_ids", "[]"))
+        class_ids = json.loads(request.form.get("class_ids", "[]"))
+    except:
+        return jsonify({"msg": "参数解析错误"}), 400
+
+    if not entry_year or not exam_name or not subject_ids:
+        return jsonify({"msg": "必要参数缺失(年级/考试/科目)"}), 400
+
+    logs = {
+        "fatal_errors": [],  # 阻断性错误
+        "warnings": [],  # 冗余/非阻断警告
+        "missing_students": [],  # 缺失名单
+    }
+
+    try:
+        df = pd.read_excel(file).fillna("")
+    except Exception as e:
+        return jsonify({"msg": f"Excel读取失败: {str(e)}"}), 400
+
+    # --- Step 1: 检查考试任务发布状态 ---
+    # 必须所有选中的科目都发布了该考试
+    selected_subjects = Subject.query.filter(Subject.id.in_(subject_ids)).all()
+    subject_map = {s.name: s.id for s in selected_subjects}  # "语文": 1
+    selected_subject_names = set(subject_map.keys())
+
+    # 查找任务
+    tasks = ExamTask.query.filter(
+        ExamTask.entry_year == entry_year,
+        ExamTask.name == exam_name,
+        ExamTask.subject_id.in_(subject_ids),
+    ).all()
+
+    # 检查是否每个选中的科目都有对应的任务
+    existing_sub_ids = set(t.subject_id for t in tasks)
+    missing_tasks = []
+    task_map = {}  # subject_name -> task_obj
+
+    for s in selected_subjects:
+        if s.id not in existing_sub_ids:
+            missing_tasks.append(s.name)
+        else:
+            # 找到对应任务
+            t = next(x for x in tasks if x.subject_id == s.id)
+            task_map[s.name] = t
+
+    if missing_tasks:
+        return (
+            jsonify(
+                {
+                    "msg": f"无法导入：科目 {missing_tasks} 尚未发布【{exam_name}】考试任务，请先去发布。"
+                }
+            ),
+            400,
+        )
+
+    # --- Step 2 & 3: 表头校验与白名单过滤 ---
+    excel_cols = set(df.columns)
+    base_cols = {"学号", "姓名", "班级名称"}
+
+    # 2.1 检查必要的基础列
+    if not base_cols.issubset(excel_cols):
+        missing = base_cols - excel_cols
+        return jsonify({"msg": f"Excel缺少基础列: {missing}"}), 400
+
+    # 2.2 识别有效科目列 (在Excel中 且 在前端已选中)
+    valid_subject_cols = []
+    missing_subjects = selected_subject_names - excel_cols
+    if missing_subjects:
+        # 直接阻断，告诉用户缺了哪些科
+        return (
+            jsonify(
+                {
+                    "msg": f"Excel文件缺失以下选中科目的数据列：{', '.join(missing_subjects)}。请检查是否使用了错误的模版。"
+                }
+            ),
+            400,
+        )
+
+    for col in df.columns:
+        if col in selected_subject_names:
+            valid_subject_cols.append(col)
+        elif col not in base_cols:
+            # Excel里有，但没选中的列 -> 警告
+            logs["warnings"].append(f"检测到未选中的列【{col}】，已自动忽略。")
+
+    if not valid_subject_cols:
+        return jsonify({"msg": "Excel中没有找到任何与当前选中科目匹配的列"}), 400
+
+    # --- 准备数据库比对数据 ---
+    # 获取目标范围内的所有学生 (用于身份校验)
+    # 如果 class_ids 为空，则校验该年级所有班级
+    cls_query = ClassInfo.query.filter_by(entry_year=entry_year)
+    if class_ids:
+        cls_query = cls_query.filter(ClassInfo.id.in_(class_ids))
+    target_classes = cls_query.all()
+    target_class_ids = [c.id for c in target_classes]
+
+    # 构建映射: full_class_name -> class_id
+    class_name_map = {}
+    for c in target_classes:
+        name = f"{str(c.entry_year)[-2:]}级({str(c.class_num).zfill(2)})班"
+        class_name_map[name] = c.id
+
+    # 获取学生: {(student_id): {name:xx, class_id:xx, db_obj:xx}}
+    db_students = Student.query.filter(
+        Student.class_id.in_(target_class_ids), Student.status == "在读"
+    ).all()
+
+    student_map = {s.student_id: s for s in db_students}
+    processed_ids = set()
+
+    # --- Step 4: 遍历并进行身份三维匹配 (内存中校验) ---
+    pending_scores = []  # 待写入的数据列表
+
+    for index, row in df.iterrows():
+        row_num = index + 2
+        sid = str(row["学号"]).strip()
+        name = str(row["姓名"]).strip()
+        cname = str(row["班级名称"]).strip()
+
+        if not sid:
+            continue  # 空行
+
+        # A. 班级过滤
+        if cname not in class_name_map:
+            # 如果这个班级不在目标范围内 (没选中 或者 名字不对)
+            # 如果是名字不对，已经在 class_name_map 覆盖了标准名
+            # 如果是没选中，这里视为“冗余行”，警告并跳过
+            logs["warnings"].append(
+                f"行{row_num}: 班级【{cname}】不在本次导入范围内，已忽略。"
+            )
+            continue
+
+        target_cid = class_name_map[cname]
+
+        # B. 身份三维匹配 (核心阻断逻辑)
+        if sid not in student_map:
+            logs["fatal_errors"].append(
+                f"行{row_num}: 学号【{sid}】在系统中不存在 (或非在读/非选中班级)。"
+            )
+            continue
+
+        stu_obj = student_map[sid]
+
+        # 校验姓名
+        if stu_obj.name != name:
+            logs["fatal_errors"].append(
+                f"行{row_num}: 学号【{sid}】对应的姓名应为【{stu_obj.name}】，Excel中为【{name}】。"
+            )
+            continue
+
+        # 校验班级归属
+        if stu_obj.class_id != target_cid:
+            logs["fatal_errors"].append(
+                f"行{row_num}: 学生【{name}】系统归属班级ID不匹配，请检查班级名称。"
+            )
+            continue
+
+        processed_ids.add(sid)
+
+        # C. 提取成绩 (暂存)
+        for sub_name in valid_subject_cols:
+            raw_val = row.get(sub_name)
+            task = task_map[sub_name]  # 肯定存在，前面Step 1校验过
+
+            # 处理空值和格式
+            # if raw_val == "" or raw_val is None:
+            #     continue  # 空值不录入，保留原样 (或者需求是覆盖为空?) 这里假设是不处理
+            # [新增修改] 严格空值校验
+            if pd.isna(raw_val) or str(raw_val).strip() == "":
+                logs["fatal_errors"].append(
+                    f"行{row_num}: 学生【{name}】缺失【{sub_name}】科目的成绩。"
+                )
+                continue  # 记了错就跳过当前科目，继续查下一科
+
+            val_str = str(raw_val).strip()
+            score_val = 0.0
+            remark_val = ""
+
+            if val_str == "缺考":
+                score_val = 0.0
+                remark_val = "缺考"
+            else:
+                try:
+                    score_val = float(val_str)
+                    if score_val < 0 or score_val > task.full_score:
+                        logs["fatal_errors"].append(
+                            f"行{row_num}: {sub_name}分数【{score_val}】超出满分【{task.full_score}】。"
+                        )
+                except:
+                    logs["fatal_errors"].append(
+                        f"行{row_num}: {sub_name}分数【{val_str}】格式错误。"
+                    )
+
+            # 加入待写入队列
+            pending_scores.append(
+                {
+                    "student_id": stu_obj.id,
+                    "exam_task_id": task.id,
+                    "subject_id": task.subject_id,
+                    "score": score_val,
+                    "remark": remark_val,
+                    "term": task.name,
+                }
+            )
+
+    # --- Step 5: 决策 (原子性写入) ---
+
+    # 5.1 如果有任何致命错误 -> 拒绝写入
+    if logs["fatal_errors"]:
+        return jsonify(
+            {
+                "status": "error",
+                "msg": f"校验未通过，发现 {len(logs['fatal_errors'])} 个致命错误，数据未写入。",
+                "logs": logs,
+            }
+        )
+
+    # 5.2 统计缺失学生 (仅提示)
+    all_target_ids = set(student_map.keys())
+    missing = all_target_ids - processed_ids
+    if missing:
+        # 取前5个名字
+        names = [student_map[m].name for m in list(missing)[:5]]
+        msg = (
+            f"共 {len(missing)} 名选中班级的学生未在Excel中找到 ({','.join(names)}...)"
+        )
+        logs["missing_students"].append(msg)
+
+    # 5.3 执行数据库写入
+    try:
+        updated_count = 0
+        added_count = 0
+
+        # 预加载现有成绩以减少查询: {(student_id, task_id): score_obj}
+        # 涉及到的所有任务
+        relevant_task_ids = [task_map[n].id for n in valid_subject_cols]
+        # 涉及到的所有学生
+        relevant_stu_ids = [p["student_id"] for p in pending_scores]
+
+        existing_scores = Score.query.filter(
+            Score.exam_task_id.in_(relevant_task_ids),
+            Score.student_id.in_(relevant_stu_ids),
+        ).all()
+
+        existing_map = {(es.student_id, es.exam_task_id): es for es in existing_scores}
+
+        for item in pending_scores:
+            key = (item["student_id"], item["exam_task_id"])
+            if key in existing_map:
+                # 更新
+                sc = existing_map[key]
+                if sc.score != item["score"] or sc.remark != item["remark"]:
+                    sc.score = item["score"]
+                    sc.remark = item["remark"]
+                    updated_count += 1
+            else:
+                # 新增
+                new_sc = Score(
+                    student_id=item["student_id"],
+                    subject_id=item["subject_id"],
+                    exam_task_id=item["exam_task_id"],
+                    score=item["score"],
+                    remark=item["remark"],
+                    term=item["term"],
+                )
+                db.session.add(new_sc)
+                added_count += 1
+
+        db.session.commit()
+
+        return jsonify(
+            {
+                "status": "success",
+                "msg": f"导入成功！新增 {added_count} 条，更新 {updated_count} 条成绩。",
+                "logs": logs,
+            }
+        )
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"msg": f"数据库写入异常: {str(e)}"}), 500
