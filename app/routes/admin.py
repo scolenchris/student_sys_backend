@@ -1804,3 +1804,218 @@ def get_class_score_stats():
         )
 
     return jsonify(result)
+
+
+@admin_bp.route("/stats/teacher_score_stats", methods=["POST"])
+def get_teacher_score_stats():
+    data = request.get_json()
+    entry_year = data.get("entry_year")  # 必填：年级 (如 2023)
+    academic_year = data.get("academic_year")  # 必填：学年 (如 2024)
+    exam_name = data.get("exam_name")  # 必填：考试名称
+
+    # 阈值 (百分比整数，如 85)
+    th_exc_rate = data.get("threshold_excellent", 85) / 100.0
+    th_pass_rate = data.get("threshold_pass", 60) / 100.0
+
+    if not entry_year or not academic_year or not exam_name:
+        return jsonify({"msg": "请选择完整的筛选条件"}), 400
+
+    # 1. 获取该年级下的所有科目 (按预定义顺序)
+    #    为了保证输出顺序，我们遍历所有科目，逐一查询
+    all_subjects = Subject.query.order_by(Subject.id).all()
+
+    final_result = []
+
+    # 缓存班级信息 {class_id: class_obj}
+    classes = ClassInfo.query.filter_by(entry_year=entry_year).all()
+    class_map = {c.id: c for c in classes}
+    if not classes:
+        return jsonify([])
+
+    grade_class_ids = [c.id for c in classes]
+
+    for sub in all_subjects:
+        # 2. 查找该科目的考试任务
+        task = ExamTask.query.filter_by(
+            entry_year=entry_year,
+            academic_year=academic_year,
+            subject_id=sub.id,
+            name=exam_name,
+        ).first()
+
+        if not task:
+            continue  # 该科目没有考这场试，跳过
+
+        full_score = task.full_score
+
+        # 3. 获取该科目、该学年、该年级的所有任课分配
+        #    注意：CourseAssignment 关联的是 class_id，我们要过滤出属于 entry_year 的班级
+        assignments = (
+            db.session.query(CourseAssignment)
+            .join(ClassInfo)
+            .filter(
+                CourseAssignment.subject_id == sub.id,
+                CourseAssignment.academic_year == academic_year,
+                ClassInfo.entry_year == entry_year,
+            )
+            .all()
+        )
+
+        if not assignments:
+            # 如果没人任课但有考试任务，可能也需要显示年级总分？
+            # 这里简单处理：如果没有任课信息，暂不显示该科统计（或者只显示一行总计）
+            pass
+
+        # 4. 按教师聚合班级
+        #    结构: { teacher_id: { 'teacher': teacher_obj, 'class_ids': [id1, id2] } }
+        teacher_map = {}
+        for assign in assignments:
+            tid = assign.teacher_id
+            if tid not in teacher_map:
+                teacher_map[tid] = {
+                    "teacher": assign.teacher,
+                    "class_ids": [],
+                    "class_names": [],
+                }
+            teacher_map[tid]["class_ids"].append(assign.class_id)
+            # 班级名简写，如 (01)班
+            c_obj = class_map.get(assign.class_id)
+            if c_obj:
+                teacher_map[tid]["class_names"].append(f"({c_obj.class_num})班")
+
+        # 5. 获取该科目本次考试的所有成绩
+        #    为了性能，一次性拉取该任务所有成绩
+        all_scores = Score.query.filter(Score.exam_task_id == task.id).all()
+
+        # 构建 { student_id: score_val } 映射，过滤缺考
+        # 注意：这里需要知道学生属于哪个班，以便归属到老师
+        #       Score 表里有 class_id_snapshot，或者是通过 student.class_id
+        #       严谨做法是：学生当前班级必须在老师任教班级里。
+
+        # 先获取该年级所有在读学生
+        students = Student.query.filter(
+            Student.class_id.in_(grade_class_ids), Student.status == "在读"
+        ).all()
+
+        student_cls_map = {s.id: s.class_id for s in students}
+
+        # 筛选有效成绩
+        # valid_scores_map: { student_id: score }
+        valid_scores_map = {}
+        for sc in all_scores:
+            if sc.student_id in student_cls_map and sc.remark != "缺考":
+                valid_scores_map[sc.student_id] = sc.score
+
+        # --- 计算年级总数据 (Grade Total) ---
+        # 统计该年级所有班级的学生（不管有没有老师教）
+        grade_total_students = len(students)  # 年级总人数
+        grade_exam_scores = []
+        for sid in student_cls_map:
+            if sid in valid_scores_map:
+                grade_exam_scores.append(valid_scores_map[sid])
+
+        grade_exam_count = len(grade_exam_scores)
+        grade_sum = sum(grade_exam_scores)
+        grade_avg = grade_sum / grade_exam_count if grade_exam_count > 0 else 0
+
+        # 辅助计算函数
+        def calc_stats(score_list, total_stu_count):
+            count = len(score_list)
+            if count == 0:
+                # [修正点] 这里之前写了6个0，必须改为5个，否则解包报错
+                return 0, 0, 0, 0, 0
+
+            exc_cnt = sum(1 for s in score_list if s >= full_score * th_exc_rate)
+            pass_cnt = sum(1 for s in score_list if s >= full_score * th_pass_rate)
+            avg = sum(score_list) / count
+
+            return (
+                exc_cnt,
+                round(exc_cnt / count * 100, 1),
+                pass_cnt,
+                round(pass_cnt / count * 100, 1),
+                round(avg, 2),
+            )
+
+        # 6. 计算每位老师的数据
+        teacher_rows = []
+        for tid, t_data in teacher_map.items():
+            t_class_ids = set(t_data["class_ids"])
+            # 找出属于这些班级的学生
+            t_stu_ids = [
+                sid for sid, cid in student_cls_map.items() if cid in t_class_ids
+            ]
+            t_total_people = len(t_stu_ids)
+
+            # 找出这些学生的成绩
+            t_scores = [
+                valid_scores_map[sid] for sid in t_stu_ids if sid in valid_scores_map
+            ]
+            t_exam_people = len(t_scores)
+
+            exc_n, exc_r, pass_n, pass_r, t_avg = calc_stats(t_scores, t_total_people)
+
+            # 班级名排序并拼接
+            t_data["class_names"].sort()
+            # 加上年级前缀，如 2023级(1)班, (2)班 -> 简略显示
+            # 或者完整显示：2023级(1)班，2023级(2)班
+            # 需求说：使用中文逗号分隔
+            full_class_names = [f"{entry_year}级{n}" for n in t_data["class_names"]]
+
+            teacher_rows.append(
+                {
+                    "name": t_data["teacher"].name,
+                    "academic_year": f"{academic_year}学年",
+                    "subject": sub.name,
+                    "exam_name": exam_name,
+                    "full_score": full_score,
+                    "classes": "，".join(full_class_names),
+                    "total_people": t_total_people,
+                    "exam_people": t_exam_people,
+                    "excellent_count": exc_n,
+                    "excellent_rate": exc_r,
+                    "pass_count": pass_n,
+                    "pass_rate": pass_r,
+                    "avg_score": t_avg,
+                    "grade_ratio": round(t_avg / grade_avg, 2) if grade_avg > 0 else 0,
+                    "_sort_key": t_avg,  # 用于排序
+                }
+            )
+
+        # 7. 组内排序：按平均分降序
+        teacher_rows.sort(key=lambda x: x["_sort_key"], reverse=True)
+
+        # 8. 填充排名 (Rank)
+        for i, row in enumerate(teacher_rows):
+            row["rank"] = i + 1
+
+        # 9. 构建年级总计行
+        g_exc_n, g_exc_r, g_pass_n, g_pass_r, g_avg_res = calc_stats(
+            grade_exam_scores, grade_total_students
+        )
+
+        total_row = {
+            "name": f"{entry_year}级{sub.name}总计",
+            "academic_year": f"{academic_year}学年",
+            "subject": sub.name,
+            "exam_name": exam_name,
+            "full_score": full_score,
+            "classes": "全年级",
+            "total_people": grade_total_students,
+            "exam_people": grade_exam_count,
+            "excellent_count": g_exc_n,
+            "excellent_rate": g_exc_r,
+            "pass_count": g_pass_n,
+            "pass_rate": g_pass_r,
+            "avg_score": round(g_avg_res, 2),  # 重新保留2位
+            "grade_ratio": 1.0,
+            "rank": "-",
+        }
+
+        # 10. 合并到最终结果
+        final_result.extend(teacher_rows)
+        # 如果有数据，才加总计行
+        if teacher_rows or grade_exam_count > 0:
+            final_result.append(total_row)
+
+    return jsonify(final_result)
