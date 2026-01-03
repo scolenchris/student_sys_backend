@@ -1,5 +1,7 @@
 import os
 import sys
+from waitress import serve
+
 # 动态获取当前文件 (run.py) 所在的绝对路径
 basedir = os.path.dirname(os.path.abspath(__file__))
 # 将该路径加入搜索列表的首位
@@ -14,8 +16,11 @@ except ModuleNotFoundError as e:
     raise e
 app = create_app()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # host='0.0.0.0' 允许局域网内的其他电脑访问该服务器
     # port=5000 默认端口
     # debug=True 开发环境开启，老旧电脑建议上线后设为 False 减少资源占用
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # app.run(host='0.0.0.0', port=5000, debug=True)
+    print("系统启动中... 请访问 http://localhost:5000")
+    # 使用 waitress 启动，支持并发，更稳定
+    serve(app, host="0.0.0.0", port=5000, threads=6)
