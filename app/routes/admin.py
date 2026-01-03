@@ -1620,9 +1620,17 @@ def generate_certificate(student_id):
     # 假设模板放在后端项目根目录下
     template_name = "certificate_template.docx"
     # 获取绝对路径，防止路径错误
-    base_dir = os.path.abspath(os.path.dirname(__file__))  # app/routes
-    # 回退两级找到项目根目录 (根据你的项目结构调整，通常在 run.py 同级)
-    root_dir = os.path.abspath(os.path.join(base_dir, "..", ".."))
+    import sys
+
+    if getattr(sys, "frozen", False):
+        # 如果是打包后的 exe 环境
+        root_dir = os.path.dirname(sys.executable)
+    else:
+        # 开发环境
+        root_dir = os.path.abspath(
+            os.path.join(os.path.abspath(os.path.dirname(__file__)), "..", "..")
+        )
+
     template_path = os.path.join(root_dir, template_name)
 
     if not os.path.exists(template_path):
