@@ -6,11 +6,19 @@ from sqlalchemy import UniqueConstraint  # 引入联合唯一约束
 db = SQLAlchemy()
 
 
+# 注册状态表
+class SystemSetting(db.Model):
+    __tablename__ = "system_settings"
+    key = db.Column(db.String(50), primary_key=True)  # 例如 "allow_register"
+    value = db.Column(db.String(255))  # 例如 "1" 或 "0"
+
+
 # 1. 用户表 (不变)
 class User(db.Model):
     __tablename__ = "users"
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    real_name = db.Column(db.String(64), nullable=True)
     password_hash = db.Column(db.String(256), nullable=False)
     role = db.Column(db.String(20), nullable=False)
     is_approved = db.Column(db.Boolean, default=False)

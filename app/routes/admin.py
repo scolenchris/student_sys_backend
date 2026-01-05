@@ -10,6 +10,7 @@ from app.models import (
     CourseAssignment,
     Student,
     Score,
+    SystemSetting,
 )
 from app.models import (
     HeadTeacherAssignment,
@@ -50,17 +51,31 @@ SUBJECT_PRIORITY = [
 @admin_bp.route("/pending_users", methods=["GET"])
 def get_pending_users():
     users = User.query.filter_by(is_approved=False).all()
-    return jsonify(
-        [
+    results = []
+
+    for user in users:
+        # 1. 确定姓名
+        # 新注册用户还没档案，取 real_name；老用户取档案里的 name
+        if user.teacher_profile:
+            name = user.teacher_profile.name
+            # 核心修正：如果是老用户，状态直接取档案里的状态 (如 '退休', '离职')
+            current_status = user.teacher_profile.status
+        else:
+            name = user.real_name if user.real_name else "未填"
+            # 核心修正：没有档案的才是 '新注册'
+            current_status = "新注册"
+
+        results.append(
             {
                 "id": user.id,
                 "username": user.username,
                 "role": user.role,
-                "name": user.teacher_profile.name if user.teacher_profile else "管理员",
+                "name": name,
+                "current_status": current_status,  # 返回真实状态
             }
-            for user in users
-        ]
-    )
+        )
+
+    return jsonify(results)
 
 
 # 审核通过
@@ -69,9 +84,18 @@ def approve_user(user_id):
     user = User.query.get(user_id)
     if not user:
         return jsonify({"msg": "用户不存在"}), 404
+
+    # 核心逻辑：如果是老师，且还没有档案，则创建
+    if user.role == "teacher" and not user.teacher_profile:
+        # 使用 User 表里存的真实姓名，如果没有则用用户名兜底
+        t_name = user.real_name if user.real_name else user.username
+        new_teacher = Teacher(user_id=user.id, name=t_name, status="在职")
+        db.session.add(new_teacher)
+        print(f">> [自动建档] 已为 {user.username} 创建教师档案")
+
     user.is_approved = True
     db.session.commit()
-    return jsonify({"msg": "审核已通过"})
+    return jsonify({"msg": "审核已通过，教师档案已建立"})
 
 
 # 拒绝申请（直接删除记录）
@@ -1003,6 +1027,7 @@ def import_teachers_excel():
 
         added_count = 0
         updated_count = 0
+        frozen_count = 0  # 统计冻结人数
 
         # 2. 遍历并写入
         for index, row in df.iterrows():
@@ -1014,6 +1039,7 @@ def import_teachers_excel():
             # A. 查找或创建用户
             user = User.query.filter_by(username=username).first()
             if not user:
+                # 新用户默认批准 (is_approved=True)
                 user = User(
                     username=username,
                     role="teacher",
@@ -1038,11 +1064,24 @@ def import_teachers_excel():
                     db.session.add(teacher)
                     db.session.flush()
 
-            # B. 更新基础信息
+            # B. 更新基础信息与状态控制 (核心修改部分)
             teacher.gender = str(row.get("性别", teacher.gender))
             teacher.phone = str(row.get("电话", teacher.phone))
             teacher.job_title = str(row.get("职称", teacher.job_title))
-            teacher.status = str(row.get("状态", teacher.status))
+
+            # 获取 Excel 中的状态
+            new_status = str(row.get("状态", "")).strip()
+            if new_status:
+                teacher.status = new_status
+
+                # 状态逻辑判断
+                if new_status in ["退休", "离职", "非在职"]:
+                    # 自动冻结账号
+                    user.is_approved = False
+                    frozen_count += 1
+                elif new_status in ["在职", "返聘"]:
+                    # 确保账号是激活状态 (用于返聘场景)
+                    user.is_approved = True
 
             # C. 插入行政职务 (此时数据已安全)
 
@@ -1097,7 +1136,7 @@ def import_teachers_excel():
         db.session.commit()
         return jsonify(
             {
-                "msg": f"处理完成。新增教师 {added_count} 人，更新 {updated_count} 人。行政职务已更新至 {academic_year} 学年。"
+                "msg": f"处理完成。新增 {added_count} 人，更新 {updated_count} 人，其中 {frozen_count} 人因退休/离职被冻结。"
             }
         )
 
@@ -2438,3 +2477,30 @@ def import_admin_scores():
     except Exception as e:
         db.session.rollback()
         return jsonify({"msg": f"数据库写入异常: {str(e)}"}), 500
+
+
+@admin_bp.route("/system/settings", methods=["GET"])
+def get_system_settings():
+    # 获取所有设置
+    allow_reg = SystemSetting.query.get("allow_register")
+    return jsonify(
+        {"allow_register": allow_reg.value == "1" if allow_reg else True}  # 默认开启
+    )
+
+
+@admin_bp.route("/system/settings", methods=["POST"])
+def update_system_settings():
+    data = request.get_json()
+    allow = data.get("allow_register")  # Boolean
+
+    val = "1" if allow else "0"
+
+    setting = SystemSetting.query.get("allow_register")
+    if not setting:
+        setting = SystemSetting(key="allow_register", value=val)
+        db.session.add(setting)
+    else:
+        setting.value = val
+
+    db.session.commit()
+    return jsonify({"msg": "系统设置已更新"})
