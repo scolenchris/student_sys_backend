@@ -1,7 +1,12 @@
 import os
+import sys
 
-# 获取当前文件所在的目录绝对路径，用于定位 SQLite 数据库文件
-basedir = os.path.abspath(os.path.dirname(__file__))
+# if getattr(sys, "frozen", False):
+#     basedir = os.path.dirname(sys.executable)
+# else:
+#     basedir = os.path.abspath(os.path.dirname(__file__))
+
+basedir = os.getcwd()
 
 
 class Config:

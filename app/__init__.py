@@ -5,6 +5,7 @@ from .models import db
 from sqlalchemy.exc import OperationalError
 from flask import jsonify
 import os
+import sys
 
 # from sqlalchemy import event
 # from sqlalchemy.engine import Engine
@@ -25,10 +26,37 @@ import os
 
 
 def create_app(config_class=Config):
-    # app = Flask(__name__)
-    app = Flask(
-        __name__, static_folder="../../student_sys_frontend/dist", static_url_path=""
-    )
+    # --- 1. 更加稳健的路径查找逻辑 ---
+
+    # 路径A：当前工作目录下的 dist (通常是用户双击 exe 时的目录)
+    cwd_dist = os.path.join(os.getcwd(), "dist")
+
+    # 路径B：exe 文件所在目录下的 dist (防止某些情况下工作目录不一致)
+    exe_dist = os.path.join(os.path.dirname(sys.executable), "dist")
+
+    # 路径C：开发环境的相对路径
+    dev_dist = "../../student_sys_frontend/dist"
+
+    # --- 2. 依次检测 ---
+    if os.path.exists(cwd_dist):
+        dist_path = cwd_dist
+        mode_msg = "生产模式 (在当前目录下找到 dist)"
+    elif os.path.exists(exe_dist):
+        dist_path = exe_dist
+        mode_msg = "生产模式 (在exe目录下找到 dist)"
+    else:
+        dist_path = dev_dist
+        mode_msg = "开发模式 (未找到本地dist，尝试使用源码路径)"
+
+    # --- 3. 打印调试信息 ---
+    print("=" * 60)
+    print(f"[DEBUG] 路径判定结果: {mode_msg}")
+    print(f"[DEBUG] 最终使用的前端路径: {dist_path}")
+    print(f"[DEBUG] 路径有效性校验: {os.path.exists(dist_path)}")
+    print("=" * 60)
+
+    # --- 4. 初始化 Flask ---
+    app = Flask(__name__, static_folder=dist_path, static_url_path="")
     app.config.from_object(config_class)
 
     # 1. 初始化插件
