@@ -50,9 +50,9 @@ def create_app(config_class=Config):
 
     # --- 3. 打印调试信息 ---
     print("=" * 60)
-    print(f"[DEBUG] 路径判定结果: {mode_msg}")
-    print(f"[DEBUG] 最终使用的前端路径: {dist_path}")
-    print(f"[DEBUG] 路径有效性校验: {os.path.exists(dist_path)}")
+    print(f"路径判定结果: {mode_msg}")
+    print(f"最终使用的前端路径: {dist_path}")
+    print(f"路径有效性校验: {os.path.exists(dist_path)}")
     print("=" * 60)
 
     # --- 4. 初始化 Flask ---
