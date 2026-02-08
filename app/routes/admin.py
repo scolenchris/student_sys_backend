@@ -937,6 +937,95 @@ def import_students_excel():
         return jsonify({"msg": f"导入失败: {str(e)}"}), 500
 
 
+@admin_bp.route("/students/export", methods=["GET"])
+def export_students():
+    # 支持按班级导出，未选择则导出全部
+    class_id = request.args.get("class_id", type=int)
+
+    query = Student.query
+    if class_id:
+        query = query.filter_by(class_id=class_id)
+
+    # 联表查询以便按年级班级排序
+    students = (
+        query.join(ClassInfo)
+        .order_by(
+            ClassInfo.entry_year.desc(),
+            ClassInfo.class_num.asc(),
+            Student.student_id.asc(),
+        )
+        .all()
+    )
+
+    # 定义列头 (需与 import_students_excel 的识别列保持一致)
+    columns = [
+        "学号",
+        "姓名",
+        "性别",
+        "班级",
+        "状态",
+        "身份证号",
+        "市学籍号",
+        "国家学籍号",
+        "户口属地",
+        "备注",
+    ]
+
+    data_list = []
+    for s in students:
+        # 格式化班级名: 23级(01)班
+        class_name = ""
+        if s.current_class_rel:
+            c = s.current_class_rel
+            short_year = str(c.entry_year)[-2:]
+            class_num_str = str(c.class_num).zfill(2)
+            class_name = f"{short_year}级({class_num_str})班"
+
+        data_list.append(
+            {
+                "学号": s.student_id,
+                "姓名": s.name,
+                "性别": s.gender,
+                "班级": class_name,
+                "状态": s.status,
+                "身份证号": s.id_card_number,
+                "市学籍号": s.city_school_id,
+                "国家学籍号": s.national_school_id,
+                "户口属地": s.household_registration,
+                "备注": s.remarks,
+            }
+        )
+
+    # 生成 DataFrame
+    df = pd.DataFrame(data_list, columns=columns)
+
+    # 写入 Excel
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="学生信息")
+
+    output.seek(0)
+
+    # 生成文件名
+    fname = "全体学生名单_备份.xlsx"
+    if class_id:
+        cls = ClassInfo.query.get(class_id)
+        if cls:
+            fname = f"{cls.full_name}_学生名单.xlsx"
+
+    from urllib.parse import quote
+
+    filename = quote(fname)
+
+    return send_file(
+        output,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=filename,
+        max_age=0,
+    )
+
+
 # 导入老师
 @admin_bp.route("/teachers/import", methods=["POST"])
 def import_teachers_excel():
@@ -1573,7 +1662,14 @@ def export_course_assignments():
 # --- 9. 导出教师信息 Excel---
 @admin_bp.route("/teachers/export", methods=["GET"])
 def export_teachers():
-    # 1. 查询所有教师数据，预加载关联数据以提升性能
+    # 1. 获取学年参数 (参考 get_teachers 的逻辑)
+    current_year = datetime.now().year
+    default_year = current_year if datetime.now().month >= 9 else current_year - 1
+    # 获取前端传来的学年，如果没有则默认当前学年
+    target_year = request.args.get("academic_year", default_year, type=int)
+
+    # 2. 查询所有教师数据
+    # (可选：如果你希望导出也支持按“状态”筛选，可以在这里加 status = request.args.get('status'))
     teachers = Teacher.query.all()
 
     # 定义导出列头 (与导入模板保持一致)
@@ -1593,38 +1689,49 @@ def export_teachers():
 
     data_list = []
 
-    # 2. 遍历教师，构造数据行
+    # 3. 遍历教师，构造数据行
     for t in teachers:
         # 获取关联的账号信息 (工号)
         user = User.query.get(t.user_id)
         username = user.username if user else ""
 
-        # A. 格式化班主任分配: "23级(01)班, 23级(02)班"
+        # --- 核心修改：只导出 target_year 的职务 ---
+
+        # A. 班主任
         ht_list = [
-            h.class_info.full_name for h in t.head_teacher_assigns if h.class_info
+            h.class_info.full_name
+            for h in t.head_teacher_assigns
+            if h.class_info and h.academic_year == target_year
         ]
         ht_str = "，".join(ht_list)
 
-        # B. 格式化级长分配: "2023级, 2024级"
-        gl_list = [f"{g.entry_year}级" for g in t.grade_leader_assigns]
+        # B. 级长
+        gl_list = [
+            f"{g.entry_year}级"
+            for g in t.grade_leader_assigns
+            if g.academic_year == target_year
+        ]
         gl_str = "，".join(gl_list)
 
-        # C. 格式化科组长分配: "语文, 数学"
-        sgl_list = [s.subject.name for s in t.subject_group_assigns if s.subject]
+        # C. 科组长
+        sgl_list = [
+            s.subject.name
+            for s in t.subject_group_assigns
+            if s.subject and s.academic_year == target_year
+        ]
         sgl_str = "，".join(sgl_list)
 
-        # D. 格式化备课组长分配: "2023级语文, 2024级数学"
+        # D. 备课组长
         pgl_list = []
         for p in t.prep_group_assigns:
-            if p.subject:
+            if p.subject and p.academic_year == target_year:
                 pgl_list.append(f"{p.entry_year}级{p.subject.name}")
         pgl_str = "，".join(pgl_list)
 
-        # E. 格式化任教分配: "23级(01)班-语文, 23级(02)班-数学"
+        # E. 任教分配
         course_list = []
         for c in t.course_assignments:
-            if c.class_info and c.subject:
-                # 组合格式需与导入解析逻辑 split('-') 匹配
+            if c.class_info and c.subject and c.academic_year == target_year:
                 course_list.append(f"{c.class_info.full_name}-{c.subject.name}")
         course_str = "，".join(course_list)
 
@@ -1644,19 +1751,18 @@ def export_teachers():
             }
         )
 
-    # 3. 生成 DataFrame
+    # 4. 生成 DataFrame
     df = pd.DataFrame(data_list, columns=columns)
 
-    # 如果没有数据，pandas 也会生成一个只有表头的空文件，正好作为模板
-
-    # 4. 写入内存并返回
+    # 5. 写入内存并返回
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="教师信息表")
+        # Sheet名也可以加上学年提示
+        df.to_excel(writer, index=False, sheet_name=f"{target_year}学年教师信息")
 
     output.seek(0)
 
-    filename = "教师信息表(模板_备份).xlsx"
+    filename = f"{target_year}学年_教师信息表(备份).xlsx"
     from urllib.parse import quote
 
     filename = quote(filename)
