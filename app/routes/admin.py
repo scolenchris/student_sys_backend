@@ -1581,6 +1581,7 @@ def export_teachers():
         "工号",
         "姓名",
         "性别",
+        "状态",
         "电话",
         "职称",
         "班主任分配",
@@ -1632,6 +1633,7 @@ def export_teachers():
                 "工号": username,
                 "姓名": t.name,
                 "性别": t.gender,
+                "状态": t.status,
                 "电话": t.phone,
                 "职称": t.job_title,
                 "班主任分配": ht_str,
@@ -2556,3 +2558,137 @@ def update_system_settings():
 
     db.session.commit()
     return jsonify({"msg": "系统设置已更新"})
+
+
+# --- 10. 管理员成绩录入 (新增) ---
+
+
+# A. 获取某班级所有可录入的考试 (跨科目)
+@admin_bp.route("/score_entry/exams", methods=["GET"])
+def get_class_active_exams():
+    class_id = request.args.get("class_id", type=int)
+    if not class_id:
+        return jsonify([])
+
+    # 1. 获取班级信息以确定年级
+    cls = ClassInfo.query.get(class_id)
+    if not cls:
+        return jsonify([])
+
+    # 2. 查询该年级下所有开启的考试，并关联科目表以获取科目名
+    tasks = (
+        db.session.query(ExamTask, Subject.name.label("subject_name"))
+        .join(Subject, ExamTask.subject_id == Subject.id)
+        .filter(
+            ExamTask.entry_year == cls.entry_year,
+            ExamTask.is_active == True,  # 只显示开启录入的
+        )
+        .order_by(ExamTask.create_time.desc())
+        .all()
+    )
+
+    return jsonify(
+        [
+            {
+                "id": t.ExamTask.id,
+                "name": t.ExamTask.name,  # 考试名
+                "subject_name": t.subject_name,  # 科目名
+                "full_score": t.ExamTask.full_score,
+                # 组合显示名称，如 "[数学] 初一上期末"
+                "display_name": f"[{t.subject_name}] {t.ExamTask.name}",
+            }
+            for t in tasks
+        ]
+    )
+
+
+# B. 获取学生名单与现有成绩 (复用逻辑)
+@admin_bp.route("/score_entry/student_list", methods=["GET"])
+def get_admin_score_list():
+    class_id = request.args.get("class_id")
+    exam_task_id = request.args.get("exam_task_id")
+
+    if not exam_task_id or not class_id:
+        return jsonify([])
+
+    # 获取班级在读学生
+    students = Student.query.filter_by(class_id=class_id, status="在读").all()
+
+    result = []
+    for s in students:
+        score_record = Score.query.filter_by(
+            student_id=s.id, exam_task_id=exam_task_id
+        ).first()
+
+        display_val = None
+        if score_record:
+            display_val = (
+                "缺考" if score_record.remark == "缺考" else score_record.score
+            )
+
+        result.append(
+            {
+                "student_id": s.id,
+                "student_no": s.student_id,
+                "name": s.name,
+                "score": display_val,
+            }
+        )
+
+    return jsonify(result)
+
+
+# C. 管理员保存成绩
+@admin_bp.route("/score_entry/save", methods=["POST"])
+def save_admin_scores():
+    data = request.get_json()
+    exam_task_id = data.get("exam_task_id")
+    scores_data = data.get("scores")
+
+    task = ExamTask.query.get(exam_task_id)
+    if not task:
+        return jsonify({"msg": "考试任务不存在"}), 404
+
+    # 管理员端通常也应遵守锁定规则，或在此处根据需求放开
+    if not task.is_active:
+        return jsonify({"msg": "该考试已锁定，无法修改"}), 403
+
+    for item in scores_data:
+        raw_val = item["score"]
+
+        # 数据清洗逻辑 (与教师端一致)
+        final_score = 0.0
+        final_remark = ""
+
+        if raw_val is None or str(raw_val).strip() == "":
+            continue  # 空值不处理
+
+        if str(raw_val).strip() == "缺考":
+            final_score = 0.0
+            final_remark = "缺考"
+        else:
+            try:
+                final_score = float(raw_val)
+            except ValueError:
+                continue
+
+        existing_score = Score.query.filter_by(
+            student_id=item["student_id"], exam_task_id=exam_task_id
+        ).first()
+
+        if existing_score:
+            existing_score.score = final_score
+            existing_score.remark = final_remark
+        else:
+            new_score = Score(
+                student_id=item["student_id"],
+                subject_id=task.subject_id,
+                exam_task_id=exam_task_id,
+                score=final_score,
+                term=task.name,
+                remark=final_remark,
+            )
+            db.session.add(new_score)
+
+    db.session.commit()
+    return jsonify({"msg": "成绩保存成功"})
