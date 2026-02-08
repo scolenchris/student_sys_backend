@@ -833,15 +833,11 @@ def import_students_excel():
         return jsonify({"msg": "文件名为空"}), 400
 
     try:
-        # 读取 Excel
-        df = pd.read_excel(file)
+        df = pd.read_excel(file).fillna("")
 
-        # --- 修改点 1: 表头模糊匹配 ---
-        # 寻找包含 "班级" 的列
+        # 1. 动态识别必要列
         class_col = next((col for col in df.columns if "班级" in str(col)), None)
-        # 寻找包含 "姓名" 的列
         name_col = next((col for col in df.columns if "姓名" in str(col)), None)
-        # 寻找包含 "学号" 的列
         id_col = next((col for col in df.columns if "学号" in str(col)), None)
 
         if not class_col or not name_col or not id_col:
@@ -849,48 +845,55 @@ def import_students_excel():
 
         success_count = 0
         updated_count = 0
+        warnings = []  # 用于收集非阻断性问题
 
-        # 预编译正则：兼容 "23级(01)班", "2023级（1）班", "23级 (1) 班"
+        # 班级正则
         class_pattern = re.compile(r"(\d+)级\s*[（\(](\d+)[）\)]\s*班")
 
-        for index, row in df.iterrows():
-            # --- 修改点 2: 使用动态列名获取数据 ---
-            class_str = str(row[class_col]).strip()
+        # 辅助函数：清洗 .0 结尾的字符串
+        def clean_str(val):
+            s = str(val).strip()
+            return s[:-2] if s.endswith(".0") else s
 
-            # --- 修改点 3: 宽松正则解析与标准化 ---
+        for index, row in df.iterrows():
+            row_num = index + 2
+
+            # --- A. 解析班级 ---
+            class_str = str(row[class_col]).strip()
             match = class_pattern.search(class_str)
 
             class_id = None
             if match:
-                y_str = match.group(1)  # 年份
-                n_str = match.group(2)  # 班号
-
-                # 补全年份 (23 -> 2023)
+                y_str = match.group(1)
+                n_str = match.group(2)
                 short_year = int(y_str)
                 entry_year = 2000 + short_year if short_year < 100 else short_year
-
-                # 班号转整数 (01 -> 1)
                 class_num = int(n_str)
 
-                # 查找班级是否存在，不存在则创建
-                existing_class = ClassInfo.query.filter_by(
+                # 查找或创建班级
+                cls = ClassInfo.query.filter_by(
                     entry_year=entry_year, class_num=class_num
                 ).first()
-                if existing_class:
-                    class_id = existing_class.id
-                else:
-                    new_class = ClassInfo(entry_year=entry_year, class_num=class_num)
-                    db.session.add(new_class)
-                    db.session.flush()  # 以此获取 id
-                    class_id = new_class.id
+                if not cls:
+                    cls = ClassInfo(entry_year=entry_year, class_num=class_num)
+                    db.session.add(cls)
+                    db.session.flush()  # 立即获取ID
+                class_id = cls.id
             else:
-                # 班级格式无法解析，跳过
+                warnings.append(
+                    f"行{row_num}: 班级格式无法识别【{class_str}】，已跳过。"
+                )
                 continue
 
-            # 2. 准备学生数据
-            student_id = str(row["学号"]).strip()
+            # --- B. 处理学生 ---
+            # 1. 清洗学号 (修复 20240102.0 问题)
+            student_id = clean_str(row[id_col])
+            if not student_id:
+                continue
 
-            # 检查学生是否已存在 (更新或跳过，这里选择更新)
+            name = str(row[name_col]).strip()
+
+            # 2. 查找现有记录
             student = Student.query.filter_by(student_id=student_id).first()
             is_new = False
 
@@ -898,29 +901,38 @@ def import_students_excel():
                 student = Student(student_id=student_id)
                 is_new = True
 
-            # 填充/更新字段
-            student.name = str(row["姓名"])
-            student.gender = str(row.get("性别", "男"))
+            # 3. 更新基础信息
+            student.name = name
             student.class_id = class_id
-            student.status = str(row.get("状态", "在读"))
-            student.household_registration = str(row.get("户口属地", "本市"))
-            student.id_card_number = str(row.get("身份证号", ""))
+            student.gender = str(row.get("性别", "男")).strip()
+            student.status = str(row.get("状态", "在读")).strip()
+            student.household_registration = str(row.get("户籍", "")).strip()
+            student.remarks = str(row.get("备注", "")).strip()
 
-            # 处理学籍号，确保是字符串且去除 .0 (pandas读取数字有时会带小数)
-            city_sid = str(row.get("市学籍号", ""))
-            if city_sid.endswith(".0"):
-                city_sid = city_sid[:-2]
-            student.city_school_id = city_sid
+            student.city_school_id = clean_str(row.get("市学籍号", ""))
+            student.national_school_id = clean_str(row.get("国家学籍号", ""))
 
-            nat_sid = str(row.get("国家学籍号", ""))
-            if nat_sid.endswith(".0"):
-                nat_sid = nat_sid[:-2]
-            student.national_school_id = nat_sid
+            # 4. 身份证号查重逻辑 (防止 IntegrityError)
+            raw_id_card = str(row.get("身份证号", "")).strip()
+            if raw_id_card:
+                # 检查该身份证是否被【其他人】占用了
+                # 注意：这里会触发 flush，如果之前的行有未解决的冲突，会在这一步报错
+                # 所以我们必须确保每一行处理完都是 clean 的
+                conflict_stu = Student.query.filter_by(
+                    id_card_number=raw_id_card
+                ).first()
 
-            student.remarks = (
-                str(row.get("备注", "")) if pd.notna(row.get("备注")) else ""
-            )
+                if conflict_stu and conflict_stu.student_id != student_id:
+                    # 冲突：身份证已存在，且不属于当前学生
+                    warnings.append(
+                        f"行{row_num}: 学生【{name}】的身份证号与库中【{conflict_stu.name}】重复，已忽略身份证更新。"
+                    )
+                    # 不设置 student.id_card_number，保持原样(如果是新建则为None)
+                else:
+                    # 无冲突，或属于自己 -> 安全更新
+                    student.id_card_number = raw_id_card
 
+            # 5. 提交到 Session
             if is_new:
                 db.session.add(student)
                 success_count += 1
@@ -928,13 +940,28 @@ def import_students_excel():
                 updated_count += 1
 
         db.session.commit()
+
+        msg = f"导入成功！新增 {success_count} 人，更新 {updated_count} 人。"
+        if warnings:
+            # 如果有警告，显示前3条
+            msg += f" (有 {len(warnings)} 条警告: {'; '.join(warnings[:3])}...)"
+
         return jsonify(
-            {"msg": f"操作完成", "added": success_count, "updated": updated_count}
+            {
+                "msg": msg,
+                "added": success_count,
+                "updated": updated_count,
+                "warnings": warnings,
+            }
         )
 
     except Exception as e:
-        print(e)
-        return jsonify({"msg": f"导入失败: {str(e)}"}), 500
+        db.session.rollback()
+        import traceback
+
+        traceback.print_exc()
+        # 返回具体错误信息以便排查
+        return jsonify({"msg": f"数据库错误: {str(e)}"}), 500
 
 
 @admin_bp.route("/students/export", methods=["GET"])
@@ -967,7 +994,7 @@ def export_students():
         "身份证号",
         "市学籍号",
         "国家学籍号",
-        "户口属地",
+        "户籍",
         "备注",
     ]
 
@@ -991,7 +1018,7 @@ def export_students():
                 "身份证号": s.id_card_number,
                 "市学籍号": s.city_school_id,
                 "国家学籍号": s.national_school_id,
-                "户口属地": s.household_registration,
+                "户籍": s.household_registration,
                 "备注": s.remarks,
             }
         )
@@ -2798,3 +2825,23 @@ def save_admin_scores():
 
     db.session.commit()
     return jsonify({"msg": "成绩保存成功"})
+
+
+@admin_bp.route("/students/<int:s_id>", methods=["DELETE"])
+def delete_student(s_id):
+    student = Student.query.get(s_id)
+    if not student:
+        return jsonify({"msg": "学生不存在"}), 404
+
+    try:
+        # 1. 主动删除该学生的关联成绩 (避免外键约束报错或残留垃圾数据)
+        Score.query.filter_by(student_id=s_id).delete()
+
+        # 2. 删除学生本体
+        db.session.delete(student)
+        db.session.commit()
+        return jsonify({"msg": "删除成功"})
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"msg": f"删除失败: {str(e)}"}), 500
