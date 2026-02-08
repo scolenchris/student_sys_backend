@@ -74,6 +74,7 @@ if __name__ == "__main__":
 
         # 2. 启动服务 (Waitress)
         serve(app, host="0.0.0.0", port=5173, threads=6)
+        # app.run(host="0.0.0.0", port=5173, debug=True)
 
     except OSError as e:
         if e.winerror == 10048:

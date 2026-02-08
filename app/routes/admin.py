@@ -836,29 +836,41 @@ def import_students_excel():
         # 读取 Excel
         df = pd.read_excel(file)
 
-        # 简单校验表头是否包含关键字段
-        required_columns = ["姓名", "学号", "班级名称"]
-        if not all(col in df.columns for col in required_columns):
-            return (
-                jsonify({"msg": "Excel格式错误，缺少必要列(姓名/学号/班级名称)"}),
-                400,
-            )
+        # --- 修改点 1: 表头模糊匹配 ---
+        # 寻找包含 "班级" 的列
+        class_col = next((col for col in df.columns if "班级" in str(col)), None)
+        # 寻找包含 "姓名" 的列
+        name_col = next((col for col in df.columns if "姓名" in str(col)), None)
+        # 寻找包含 "学号" 的列
+        id_col = next((col for col in df.columns if "学号" in str(col)), None)
+
+        if not class_col or not name_col or not id_col:
+            return jsonify({"msg": "Excel格式错误，缺少必要列(姓名/学号/班级)"}), 400
 
         success_count = 0
         updated_count = 0
 
+        # 预编译正则：兼容 "23级(01)班", "2023级（1）班", "23级 (1) 班"
+        class_pattern = re.compile(r"(\d+)级\s*[（\(](\d+)[）\)]\s*班")
+
         for index, row in df.iterrows():
-            # 1. 解析班级信息 "23级(01)班" -> entry_year=2023, class_num=1
-            class_str = str(row["班级名称"]).strip()
-            # 正则匹配：数字 + 级 + ( + 数字 + ) + 班
-            match = re.match(r"(\d+)级\((\d+)\)班", class_str)
+            # --- 修改点 2: 使用动态列名获取数据 ---
+            class_str = str(row[class_col]).strip()
+
+            # --- 修改点 3: 宽松正则解析与标准化 ---
+            match = class_pattern.search(class_str)
 
             class_id = None
             if match:
-                short_year = int(match.group(1))  # 23
-                class_num = int(match.group(2))  # 01
-                # 假设是 20xx 年
-                entry_year = 2000 + short_year
+                y_str = match.group(1)  # 年份
+                n_str = match.group(2)  # 班号
+
+                # 补全年份 (23 -> 2023)
+                short_year = int(y_str)
+                entry_year = 2000 + short_year if short_year < 100 else short_year
+
+                # 班号转整数 (01 -> 1)
+                class_num = int(n_str)
 
                 # 查找班级是否存在，不存在则创建
                 existing_class = ClassInfo.query.filter_by(
@@ -872,7 +884,7 @@ def import_students_excel():
                     db.session.flush()  # 以此获取 id
                     class_id = new_class.id
             else:
-                # 班级格式不对，跳过或记录日志，这里选择暂时跳过该行或设为未分配
+                # 班级格式无法解析，跳过
                 continue
 
             # 2. 准备学生数据
@@ -1261,6 +1273,9 @@ def delete_exam_task(id):
 
 
 # --- 8. 批量导入任课信息 (新增功能) ---
+# [app/routes/admin.py]
+
+
 @admin_bp.route("/assignments/import", methods=["POST"])
 def import_course_assignments():
     if "file" not in request.files:
@@ -1276,8 +1291,7 @@ def import_course_assignments():
     except Exception as e:
         return jsonify({"msg": f"Excel读取失败: {str(e)}"}), 400
 
-    # --- 定义合法年级范围 (初一至初三) ---
-    # 例如 2025学年，合法班级为 2025级、2024级、2023级
+    # --- 定义合法年级范围 ---
     valid_years = [academic_year, academic_year - 1, academic_year - 2]
     valid_years_str = "/".join([f"{y}级" for y in valid_years])
 
@@ -1288,7 +1302,7 @@ def import_course_assignments():
     all_subjects = Subject.query.all()
     subject_map = {s.name: s.id for s in all_subjects}
 
-    # 班级映射 (用于后续写入)
+    # 班级映射: "23级(01)班" -> id
     all_classes = ClassInfo.query.all()
     class_map = {}
     for c in all_classes:
@@ -1297,68 +1311,86 @@ def import_course_assignments():
         key = f"{short_year}级({class_num_str})班"
         class_map[key] = c.id
 
-    # 正则用于解析 "23级(01)班"
-    class_pattern = re.compile(r"(\d+)级\((\d+)\)班")
+    # 增强正则: 兼容 "23级(01)班", "23级（1）班"
+    class_pattern = re.compile(r"(\d+)级\s*[（\(](\d+)[）\)]\s*班")
 
-    # --- 阶段一：严格数据校验 (不操作数据库) ---
+    # --- 阶段一：严格数据校验 ---
     errors = []
     missing_teachers = set()
 
+    # 1. 动态查找班级列
+    class_col = next((col for col in df.columns if "班级" in str(col)), None)
+    if not class_col:
+        return jsonify({"msg": "Excel中未找到包含[班级]的列"}), 400
+
     for index, row in df.iterrows():
         row_num = index + 2
-        class_name = str(row.get("班级名称", "")).strip()
+        # 获取原始班级名
+        class_name_raw = str(row[class_col]).strip()
 
-        if not class_name:
+        if not class_name_raw:
             continue
 
-        # A. 校验班级是否存在于系统
-        if class_name not in class_map:
-            # 尝试解析一下看是不是年份不对
-            match = class_pattern.match(class_name)
-            if match:
-                y_str = match.group(1)
-                # 补全年份 23 -> 2023
-                entry_year = int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
+        # 解析并标准化班级名
+        match = class_pattern.search(class_name_raw)
+        standard_key = None
 
-                # 核心校验：检查年份是否合法
-                if entry_year not in valid_years:
-                    errors.append(
-                        f"行{row_num}: 班级【{class_name}】的年份在 {academic_year} 学年无效。合法范围: {valid_years_str}"
-                    )
-                else:
-                    # 年份合法但系统没这班，提示去创建
-                    errors.append(
-                        f"行{row_num}: 系统中找不到班级【{class_name}】，请先在班级管理中创建"
-                    )
-            else:
+        if match:
+            y_str = match.group(1)
+            n_str = match.group(2)
+
+            # 补全年份
+            entry_year = int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
+            short_year = str(entry_year)[-2:]
+            class_num = int(n_str)
+
+            # 构造标准 key (与 class_map 的 key 格式一致)
+            standard_key = f"{short_year}级({str(class_num).zfill(2)})班"
+
+            # 校验年份逻辑
+            if entry_year not in valid_years:
                 errors.append(
-                    f"行{row_num}: 班级名格式错误【{class_name}】，应为如 '23级(01)班'"
+                    f"行{row_num}: 班级【{standard_key}】(原:{class_name_raw}) 的年份在 {academic_year} 学年无效。合法范围: {valid_years_str}"
                 )
+                continue
+
+            # 校验是否存在于系统
+            if standard_key not in class_map:
+                errors.append(
+                    f"行{row_num}: 系统中找不到班级【{standard_key}】，请先在班级管理中创建"
+                )
+                continue
+        else:
+            errors.append(f"行{row_num}: 班级名格式无法识别【{class_name_raw}】")
             continue
 
-        # B. 如果班级存在，也要反向检查它的年份是否符合当前学年逻辑
-        # (防止用户把 2021级的班强行导入到 2025学年)
-        cls_obj = ClassInfo.query.get(class_map[class_name])
+        # B. 反向检查 (此时 standard_key 肯定在 class_map 中)
+        # 【修复点】：这里原来使用的是 class_name，现改为 standard_key
+        cls_obj = ClassInfo.query.get(class_map[standard_key])
         if cls_obj and cls_obj.entry_year not in valid_years:
             errors.append(
-                f"行{row_num}: 班级【{class_name}】是 {cls_obj.entry_year}级，不属于 {academic_year} 学年的初中范围 ({valid_years_str})"
+                f"行{row_num}: 班级【{standard_key}】是 {cls_obj.entry_year}级，不属于 {academic_year} 学年的范围"
             )
 
-        # C. 校验老师是否存在
+        # C. 校验老师是否存在 (模糊匹配表头)
         for col_name in df.columns:
+            # 跳过班级列和空列
+            if col_name == class_col or not str(col_name).strip():
+                continue
+
             cell_value = str(row[col_name]).strip()
             if not cell_value:
                 continue
 
-            if col_name == "班主任" or col_name in subject_map:
-                # 支持多个老师用逗号分隔的情况吗？目前代码逻辑看似是单个
-                # 这里假设 Excel 里填的是单个老师姓名
-                if cell_value not in teacher_map:
-                    missing_teachers.add(cell_value)
+            # 只有当列名包含 "班主任" 或 在科目列表中时才校验
+            # 简单判断：如果列名是科目名
+            is_subject = col_name in subject_map
+            is_ht = "班主任" in str(col_name)
 
-    # 汇总错误
+            if (is_subject or is_ht) and cell_value not in teacher_map:
+                missing_teachers.add(cell_value)
+
     if missing_teachers:
-        # 只显示前5个
         t_list = list(missing_teachers)[:5]
         msg = f"系统不存在以下教师: {', '.join(t_list)}"
         if len(missing_teachers) > 5:
@@ -1366,13 +1398,17 @@ def import_course_assignments():
         errors.append(msg)
 
     if errors:
-        # 格式化错误信息返回
         error_html = "<br>".join(errors[:8])
         if len(errors) > 8:
             error_html += f"<br>... 等共 {len(errors)} 处问题"
-        return jsonify({"msg": f"校验失败，请修正后重试：<br>{error_html}"}), 400
+        return (
+            jsonify(
+                {"msg": f"校验失败，请修正后重试：<br>{error_html}", "errors": errors}
+            ),
+            400,
+        )
 
-    # --- 阶段二：校验通过，执行写入 ---
+    # --- 阶段二：写入数据库 ---
     try:
         # A. 清空该学年的旧数据
         db.session.query(CourseAssignment).filter_by(
@@ -1385,19 +1421,35 @@ def import_course_assignments():
         count = 0
 
         for index, row in df.iterrows():
-            class_name = str(row.get("班级名称", "")).strip()
-            if not class_name or class_name not in class_map:
+            class_name_raw = str(row[class_col]).strip()
+            if not class_name_raw:
                 continue
-            class_id = class_map[class_name]
 
-            # B. 遍历列
+            # 再次解析获取 standard_key (因为阶段一已经校验过，这里肯定能解析成功)
+            match = class_pattern.search(class_name_raw)
+            if not match:
+                continue
+
+            y_str = match.group(1)
+            n_str = match.group(2)
+            entry_year = int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
+            short_year = str(entry_year)[-2:]
+            class_num = int(n_str)
+            standard_key = f"{short_year}级({str(class_num).zfill(2)})班"
+
+            if standard_key not in class_map:
+                continue
+
+            class_id = class_map[standard_key]
+
+            # B. 遍历列写入
             for col_name in df.columns:
                 teacher_name = str(row[col_name]).strip()
                 if not teacher_name:
                     continue
 
                 # 插入班主任
-                if col_name == "班主任":
+                if "班主任" in str(col_name):
                     teacher_id = teacher_map.get(teacher_name)
                     if teacher_id:
                         db.session.add(
@@ -1408,7 +1460,7 @@ def import_course_assignments():
                             )
                         )
 
-                # 插入任课
+                # 插入任课 (精确匹配科目名)
                 elif col_name in subject_map:
                     teacher_id = teacher_map.get(teacher_name)
                     subject_id = subject_map[col_name]
